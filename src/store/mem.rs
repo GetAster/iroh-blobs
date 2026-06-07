@@ -48,7 +48,7 @@ use crate::{
         blobs::{AddProgressItem, Bitfield, BlobStatus, ExportProgressItem},
         proto::{
             BatchMsg, BatchResponse, BlobBytesMsg, BlobBytesRequest, BlobBytesResult,
-            BlobDeleteRequest, BlobStatusMsg, BlobStatusRequest, Command, CreateTagMsg,
+            BlobDeleteRequest, BlobStatusManyMsg, BlobStatusManyRequest, BlobStatusMsg, BlobStatusRequest, Command, CreateTagMsg,
             CreateTagRequest, CreateTempTagMsg, DeleteBlobsMsg, DeleteTagsMsg, DeleteTagsRequest,
             ExportBaoMsg, ExportBaoRequest, ExportPathMsg, ExportPathRequest, ExportRangesItem,
             ExportRangesMsg, ExportRangesRequest, ImportBaoMsg, ImportBaoRequest,
@@ -402,6 +402,34 @@ impl Actor {
                     }
                 };
                 tx.send(res).await.ok();
+            }
+            Command::BlobStatusMany(cmd) => {
+                trace!("{cmd:?}");
+                let BlobStatusManyMsg {
+                    inner: BlobStatusManyRequest { hashes },
+                    tx,
+                    ..
+                } = cmd;
+                let mut out = Vec::with_capacity(hashes.len());
+                for hash in hashes {
+                    let res = match self.get(&hash) {
+                        None => api::blobs::BlobStatus::NotFound,
+                        Some(x) => {
+                            let bitfield = x.0.state.borrow().bitfield();
+                            if bitfield.is_complete() {
+                                BlobStatus::Complete {
+                                    size: bitfield.size,
+                                }
+                            } else {
+                                BlobStatus::Partial {
+                                    size: bitfield.validated_size(),
+                                }
+                            }
+                        }
+                    };
+                    out.push(res);
+                }
+                tx.send(out).await.ok();
             }
             Command::BlobBytes(cmd) => {
                 trace!("{cmd:?}");

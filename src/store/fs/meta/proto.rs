@@ -7,7 +7,7 @@ use tracing::Span;
 
 use super::{ActorResult, ReadOnlyTables};
 use crate::{
-    api::proto::{BlobStatusMsg, ClearProtectedMsg, DeleteBlobsMsg, ShutdownMsg, SyncDbMsg},
+    api::proto::{BlobStatusManyMsg, BlobStatusMsg, ClearProtectedMsg, DeleteBlobsMsg, ShutdownMsg, SyncDbMsg},
     store::{fs::entry_state::EntryState, util::DD},
     util::channel::oneshot,
     Hash,
@@ -104,6 +104,7 @@ pub enum ReadOnlyCommand {
     Dump(Dump),
     ClearProtected(ClearProtectedMsg),
     GetBlobStatus(BlobStatusMsg),
+    GetBlobStatusMany(BlobStatusManyMsg),
     GetBlobBytes(BlobBytesMsg),
 }
 
@@ -114,6 +115,7 @@ impl ReadOnlyCommand {
             Self::Dump(x) => &x.span,
             Self::ClearProtected(x) => &x.span,
             Self::GetBlobStatus(x) => &x.span,
+            Self::GetBlobStatusMany(x) => &x.span,
             Self::GetBlobBytes(x) => &x.span,
         }
     }

@@ -50,7 +50,7 @@ use super::{
             AddProgressRules, DebugOnly, ExportBaoRules, ExportPathRules, ExportRangesRules,
             ListBlobsRules, ObserveRules, Step, StreamRules,
         },
-        BatchResponse, BlobBytesRequest, BlobStatusRequest, ClearProtectedRequest, CreateTempTagRequest,
+        BatchResponse, BlobBytesRequest, BlobStatusManyRequest, BlobStatusRequest, ClearProtectedRequest, CreateTempTagRequest,
         ExportBaoRequest, ExportRangesItem, ImportBaoRequest, ImportByteStreamRequest,
         ImportBytesRequest, ImportPathRequest, ListBlobsItem, ListRequest, Scope,
     },
@@ -578,6 +578,15 @@ impl Blobs {
             return Ok(BlobStatus::Complete { size: 0 });
         }
         let msg = BlobStatusRequest { hash };
+        self.client.rpc(msg).await
+    }
+
+    pub async fn status_many(
+        &self,
+        hashes: impl IntoIterator<Item = impl Into<Hash>>,
+    ) -> irpc::Result<Vec<BlobStatus>> {
+        let hashes = hashes.into_iter().map(Into::into).collect();
+        let msg = BlobStatusManyRequest { hashes };
         self.client.rpc(msg).await
     }
 
