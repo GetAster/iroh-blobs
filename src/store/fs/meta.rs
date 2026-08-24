@@ -20,7 +20,8 @@ use crate::{
         self,
         blobs::BlobStatus,
         proto::{
-            BlobDeleteRequest, BlobStatusMsg, BlobStatusRequest, ClearProtectedMsg,
+            AddProtectedMsg, BlobDeleteRequest, BlobStatusMsg, BlobStatusRequest,
+            ClearProtectedMsg,
             CreateTagRequest, DeleteBlobsMsg, DeleteTagsRequest, ListBlobsMsg, ListRequest,
             ListTagsRequest, RenameTagRequest, SetTagRequest, ShutdownMsg, SyncDbMsg,
         },
@@ -286,6 +287,17 @@ async fn handle_clear_protected(
     cmd.tx.send(Ok(())).await.ok();
     Ok(())
 }
+
+async fn handle_add_protected(
+    cmd: AddProtectedMsg,
+    protected: &mut HashSet<Hash>,
+) -> ActorResult<()> {
+    trace!("{cmd:?}");
+    protected.extend(cmd.inner.hashes.iter().copied());
+    cmd.tx.send(Ok(())).await.ok();
+    Ok(())
+}
+
 
 async fn handle_get_blob_status(
     msg: BlobStatusMsg,
@@ -556,6 +568,7 @@ impl Actor {
             ReadOnlyCommand::Dump(cmd) => handle_dump(cmd, tables),
             ReadOnlyCommand::ListTags(cmd) => handle_list_tags(cmd, tables).await,
             ReadOnlyCommand::ClearProtected(cmd) => handle_clear_protected(cmd, protected).await,
+            ReadOnlyCommand::AddProtected(cmd) => handle_add_protected(cmd, protected).await,
             ReadOnlyCommand::GetBlobStatus(cmd) => handle_get_blob_status(cmd, tables).await,
         }
     }
