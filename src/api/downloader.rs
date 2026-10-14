@@ -19,6 +19,7 @@ use n0_error::{anyerr, Result};
 use n0_future::{
     future, stream,
     task::{JoinError, JoinSet},
+    time::{Duration, Instant},
     BufferedStreamExt, Stream, StreamExt,
 };
 use rand::seq::SliceRandom;
@@ -178,7 +179,15 @@ async fn handle_download_impl(
         SplitStrategy::None => match request.request {
             FiniteRequest::Get(get) => {
                 let sink = IrpcSenderRefSink(tx);
-                execute_get(&pool, Arc::new(get), &request.providers, &store, sink).await?;
+                execute_get(
+                    &pool,
+                    Arc::new(get),
+                    &request.providers,
+                    &store,
+                    request.provider_idle_timeout,
+                    sink,
+                )
+                .await?;
             }
             FiniteRequest::GetMany(_) => {
                 handle_download_split_impl(store, pool, request, tx).await?
@@ -219,6 +228,7 @@ async fn handle_download_split_impl(
     tx: &mut mpsc::Sender<DownloadProgressItem>,
 ) -> Result<()> {
     let providers = request.providers;
+    let idle_timeout = request.provider_idle_timeout;
     // The root fetch is a real provider attempt: report it like any other,
     // instead of dropping its events into a `Drain`. Its legacy `Progress`
     // offsets are the exception — see [`RootProgressFilter`].
@@ -227,6 +237,7 @@ async fn handle_download_split_impl(
         &providers,
         &pool,
         &store,
+        idle_timeout,
         RootProgressFilter(&mut *tx),
     )
     .await?;
@@ -242,7 +253,15 @@ async fn handle_download_split_impl(
                 let (tx, rx) = tokio::sync::mpsc::channel::<(usize, DownloadProgressItem)>(16);
                 progress_tx.send(rx).await.ok();
                 let sink = TokioMpscSenderSink(tx).with_map(move |x| (id, x));
-                let res = execute_get(&pool, Arc::new(request), &providers, &store, sink).await;
+                let res = execute_get(
+                    &pool,
+                    Arc::new(request),
+                    &providers,
+                    &store,
+                    idle_timeout,
+                    sink,
+                )
+                .await;
                 (hash, res)
             }
         })
@@ -366,6 +385,14 @@ pub struct DownloadRequest {
     pub request: FiniteRequest,
     pub providers: Arc<dyn ContentDiscovery>,
     pub strategy: SplitStrategy,
+    /// Abandon a provider attempt that delivers no payload for this long and
+    /// move on to the next provider, which is asked only for what is still
+    /// missing. `None` waits on a provider indefinitely.
+    ///
+    /// A provider that accepts a request and then stops sending never fails:
+    /// QUIC keep-alive holds its connection open, so without this one stalled
+    /// provider blocks every provider after it in the list.
+    pub provider_idle_timeout: Option<Duration>,
 }
 
 impl DownloadRequest {
@@ -378,7 +405,14 @@ impl DownloadRequest {
             request: request.into_request(),
             providers: Arc::new(providers),
             strategy,
+            provider_idle_timeout: None,
         }
+    }
+
+    /// Set [`Self::provider_idle_timeout`].
+    pub fn with_provider_idle_timeout(mut self, idle: Duration) -> Self {
+        self.provider_idle_timeout = Some(idle);
+        self
     }
 }
 
@@ -481,6 +515,7 @@ impl Downloader {
             request,
             providers,
             strategy: SplitStrategy::None,
+            provider_idle_timeout: None,
         })
     }
 
@@ -511,6 +546,7 @@ async fn split_request<'a>(
     providers: &Arc<dyn ContentDiscovery>,
     pool: &ConnectionPool,
     store: &Store,
+    idle_timeout: Option<Duration>,
     progress: impl Sink<DownloadProgressItem, Error = irpc::channel::SendError>,
 ) -> Result<Box<dyn Iterator<Item = GetRequest> + Send + 'a>> {
     Ok(match request {
@@ -519,7 +555,15 @@ async fn split_request<'a>(
                 return Ok(Box::new(std::iter::empty()));
             };
             let first = GetRequest::blob(req.hash);
-            execute_get(pool, Arc::new(first), providers, store, progress).await?;
+            execute_get(
+                pool,
+                Arc::new(first),
+                providers,
+                store,
+                idle_timeout,
+                progress,
+            )
+            .await?;
             let size = store.observe(req.hash).await?.size();
             n0_error::ensure_any!(size % 32 == 0, "Size is not a multiple of 32");
             let n = size / 32;
@@ -575,11 +619,16 @@ async fn send_bytes_transferred(
 ///
 /// If the request is not complete after trying all providers, it will return an error.
 /// If the provider stream never ends, it will try indefinitely.
+///
+/// With `idle_timeout`, an attempt that delivers no payload for that long is
+/// reported as [`DownloadProgressItem::ProviderFailed`] and the next provider
+/// is tried; without it, a provider that stalls blocks the walk.
 async fn execute_get(
     pool: &ConnectionPool,
     request: Arc<GetRequest>,
     providers: &Arc<dyn ContentDiscovery>,
     store: &Store,
+    idle_timeout: Option<Duration>,
     mut progress: impl Sink<DownloadProgressItem, Error = irpc::channel::SendError>,
 ) -> Result<()> {
     let remote = store.remote();
@@ -614,17 +663,25 @@ async fn execute_get(
         // from the returned stats instead of the last progress update.
         let attempt_bytes = Arc::new(AtomicU64::new(0));
         let attempt_counter = attempt_bytes.clone();
-        match remote
-            .execute_get_sink(
-                conn.clone(),
-                local.missing(),
-                (&mut progress).with_map(move |x| {
-                    attempt_counter.store(x, Ordering::Relaxed);
-                    DownloadProgressItem::Progress(x + local_bytes)
-                }),
-            )
-            .await
-        {
+        // Milliseconds from `started` to the attempt's latest payload progress,
+        // read by the stall guard.
+        let started = Instant::now();
+        let last_progress_ms = Arc::new(AtomicU64::new(0));
+        let progress_clock = last_progress_ms.clone();
+        let attempt = remote.execute_get_sink(
+            conn.clone(),
+            local.missing(),
+            (&mut progress).with_map(move |x| {
+                attempt_counter.store(x, Ordering::Relaxed);
+                progress_clock.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                DownloadProgressItem::Progress(x + local_bytes)
+            }),
+        );
+        let outcome = match idle_timeout {
+            None => Ok(attempt.await),
+            Some(idle) => stall_guard(attempt, started, &last_progress_ms, idle).await,
+        };
+        match outcome.and_then(|res| res.map_err(|_cause| ())) {
             Ok(stats) => {
                 send_bytes_transferred(&mut progress, stats.payload_bytes_read).await?;
                 progress
@@ -634,7 +691,7 @@ async fn execute_get(
                     .await?;
                 return Ok(());
             }
-            Err(_cause) => {
+            Err(()) => {
                 send_bytes_transferred(&mut progress, attempt_bytes.load(Ordering::Relaxed))
                     .await?;
                 progress
@@ -648,6 +705,39 @@ async fn execute_get(
         }
     }
     Err(anyerr!("Unable to download {}", request.hash))
+}
+
+/// Run one provider attempt, abandoning it once `idle` passes with no payload
+/// progress since `started` + `last_progress_ms`. `Err(())` means it stalled.
+///
+/// The clock covers the whole attempt, including opening the stream and
+/// waiting for the first chunk, so a provider that accepts and never answers
+/// is caught too.
+async fn stall_guard<T>(
+    attempt: impl Future<Output = T>,
+    started: Instant,
+    last_progress_ms: &AtomicU64,
+    idle: Duration,
+) -> std::result::Result<T, ()> {
+    let watchdog = async {
+        loop {
+            let last = Duration::from_millis(last_progress_ms.load(Ordering::Relaxed));
+            let deadline = started + last + idle;
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            n0_future::time::sleep(deadline - now).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        res = attempt => Ok(res),
+        () = watchdog => {
+            tracing::debug!(?idle, "provider attempt stalled; trying the next provider");
+            Err(())
+        }
+    }
 }
 
 /// Trait for pluggable content discovery strategies.
@@ -1203,6 +1293,137 @@ mod tests {
         assert_eq!(reported.errors, 0);
         // Root + 2 children, each walking the list from the top.
         assert_eq!(reported.failed, vec![empty.id; 3]);
+        assert_eq!(reported.completed, 3);
+        assert_eq!(reported.bytes, expected_bytes);
+        Ok(())
+    }
+
+    /// A provider that accepts a request and never answers, holding the
+    /// connection open the way a stuck peer does: QUIC keep-alive means the
+    /// connection itself never times out.
+    #[derive(Debug, Clone)]
+    struct StallingProvider;
+
+    impl iroh::protocol::ProtocolHandler for StallingProvider {
+        async fn accept(
+            &self,
+            conn: iroh::endpoint::Connection,
+        ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+            if let Ok(_streams) = conn.accept_bi().await {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+
+    async fn stalling_node() -> TestResult<iroh::protocol::Router> {
+        let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Default)
+            .bind()
+            .await?;
+        Ok(iroh::protocol::Router::builder(ep)
+            .accept(crate::ALPN, StallingProvider)
+            .spawn())
+    }
+
+    const IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+    /// Generous bound on a whole download that should fail over promptly.
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// The default keeps upstream behaviour: a stalled provider at the head of
+    /// the list blocks the providers behind it.
+    #[tokio::test]
+    async fn downloader_waits_on_a_stalled_provider_by_default() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("holder")).await?;
+        let (r3, store3, _, sp3) = node_test_setup_fs(testdir.path().join("consumer")).await?;
+        let stall = stalling_node().await?;
+        let tt = store1.add_slice(vec![42u8; 64 * 1024]).await?;
+        let holder = r1.endpoint().addr();
+        let stalled = stall.endpoint().addr();
+        sp3.add_endpoint_info(holder.clone());
+        sp3.add_endpoint_info(stalled.clone());
+        let swarm = Downloader::new(&store3, r3.endpoint());
+
+        let stream = swarm
+            .download_with_opts(DownloadOptions::new(
+                tt.hash,
+                [stalled.id, holder.id],
+                SplitStrategy::None,
+            ))
+            .stream()
+            .await?;
+        let res = tokio::time::timeout(IDLE * 6, collect(stream)).await;
+        assert!(res.is_err(), "download finished despite a stalled lead");
+        assert!(!store3.has(tt.hash).await?);
+        Ok(())
+    }
+
+    /// With an idle timeout, the stalled provider is reported failed and the
+    /// next one serves the whole blob.
+    #[tokio::test]
+    async fn downloader_idle_timeout_fails_over_from_a_stalled_provider() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("holder")).await?;
+        let (r3, store3, _, sp3) = node_test_setup_fs(testdir.path().join("consumer")).await?;
+        let stall = stalling_node().await?;
+        let data = vec![42u8; 1024 * 1024];
+        let tt = store1.add_slice(data.clone()).await?;
+        let holder = r1.endpoint().addr();
+        let stalled = stall.endpoint().addr();
+        sp3.add_endpoint_info(holder.clone());
+        sp3.add_endpoint_info(stalled.clone());
+        let swarm = Downloader::new(&store3, r3.endpoint());
+
+        let stream = swarm
+            .download_with_opts(
+                DownloadOptions::new(tt.hash, [stalled.id, holder.id], SplitStrategy::None)
+                    .with_provider_idle_timeout(IDLE),
+            )
+            .stream()
+            .await?;
+        let reported = tokio::time::timeout(BOUND, collect(stream)).await?;
+
+        assert_eq!(reported.errors, 0);
+        assert_eq!(reported.tried, vec![stalled.id, holder.id]);
+        assert_eq!(reported.failed, vec![stalled.id]);
+        assert_eq!(reported.completed, 1);
+        assert_eq!(reported.bytes, data.len() as u64);
+        assert_eq!(store3.get_bytes(tt.hash).await?.deref(), data.as_slice());
+        Ok(())
+    }
+
+    /// Split mode threads the timeout through the root fetch and every child.
+    #[tokio::test]
+    async fn downloader_split_idle_timeout_fails_over_from_a_stalled_provider() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("holder")).await?;
+        let (r3, store3, _, sp3) = node_test_setup_fs(testdir.path().join("consumer")).await?;
+        let stall = stalling_node().await?;
+        let children = vec![vec![7u8; 8192], vec![9u8; 8192]];
+        let (root, expected_bytes) = add_collection(&store1, &children).await?;
+        let holder = r1.endpoint().addr();
+        let stalled = stall.endpoint().addr();
+        sp3.add_endpoint_info(holder.clone());
+        sp3.add_endpoint_info(stalled.clone());
+        let swarm = Downloader::new(&store3, r3.endpoint());
+
+        let stream = swarm
+            .download_with_opts(
+                DownloadOptions::new(
+                    GetRequest::all(root),
+                    [stalled.id, holder.id],
+                    SplitStrategy::Split,
+                )
+                .with_provider_idle_timeout(IDLE),
+            )
+            .stream()
+            .await?;
+        let reported = tokio::time::timeout(BOUND, collect(stream)).await?;
+
+        assert_eq!(reported.errors, 0);
+        // Root + 2 children, each walking the list from the top.
+        assert_eq!(reported.failed, vec![stalled.id; 3]);
         assert_eq!(reported.completed, 3);
         assert_eq!(reported.bytes, expected_bytes);
         Ok(())
