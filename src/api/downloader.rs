@@ -29,8 +29,9 @@ use tracing::instrument::Instrument;
 use super::Store;
 use crate::{
     protocol::{GetManyRequest, GetRequest},
+    transport::{StreamTransform, TransformedConnection},
     util::{
-        connection_pool::ConnectionPool,
+        connection_pool::{ConnectionPool, ConnectionRef, PoolConnectError},
         sink::{IrpcSenderRefSink, Sink, TokioMpscSenderSink},
     },
     BlobFormat, Hash, HashAndFormat,
@@ -55,7 +56,7 @@ pub struct WaitIdleRequest;
 
 struct DownloaderActor {
     store: Store,
-    pool: ConnectionPool,
+    pool: Dialer,
     tasks: JoinSet<()>,
     idle_waiters: Vec<irpc::channel::oneshot::Sender<()>>,
 }
@@ -94,18 +95,27 @@ pub enum DownloadProgressItem {
     /// re-fetched and counted again.
     BytesTransferred(u64),
     DownloadError,
+    /// The provider refused the downloader's ALPN, and the attempt continues
+    /// over the plain blobs ALPN ([`crate::ALPN`]) with plain streams.
+    ///
+    /// Only emitted by a downloader built with
+    /// [`DownloaderBuilder::plain_fallback`], right after the
+    /// [`Self::TryProvider`] it qualifies. `cached` is true when the refusal
+    /// was remembered from an earlier attempt, so no dial on the downloader's
+    /// ALPN was made this time. This says nothing about whether the provider
+    /// has the content: the attempt's outcome is still reported by
+    /// [`Self::PartComplete`] or [`Self::ProviderFailed`].
+    PlainFallback {
+        id: EndpointId,
+        cached: bool,
+    },
 }
 
 impl DownloaderActor {
-    fn new_with_opts(
-        store: Store,
-        endpoint: Endpoint,
-        alpn: &[u8],
-        pool_options: crate::util::connection_pool::Options,
-    ) -> Self {
+    fn new(store: Store, pool: Dialer) -> Self {
         Self {
             store,
-            pool: ConnectionPool::new(endpoint, alpn, pool_options),
+            pool,
             tasks: JoinSet::new(),
             idle_waiters: Vec::new(),
         }
@@ -162,7 +172,7 @@ impl DownloaderActor {
     }
 }
 
-async fn handle_download(store: Store, pool: ConnectionPool, msg: DownloadMsg) {
+async fn handle_download(store: Store, pool: Dialer, msg: DownloadMsg) {
     let DownloadMsg { inner, mut tx, .. } = msg;
     if let Err(cause) = handle_download_impl(store, pool, inner, &mut tx).await {
         tx.send(DownloadProgressItem::Error(cause)).await.ok();
@@ -171,7 +181,7 @@ async fn handle_download(store: Store, pool: ConnectionPool, msg: DownloadMsg) {
 
 async fn handle_download_impl(
     store: Store,
-    pool: ConnectionPool,
+    pool: Dialer,
     request: DownloadRequest,
     tx: &mut mpsc::Sender<DownloadProgressItem>,
 ) -> Result<()> {
@@ -224,7 +234,7 @@ impl Sink<DownloadProgressItem> for RootProgressFilter<'_> {
 
 async fn handle_download_split_impl(
     store: Store,
-    pool: ConnectionPool,
+    pool: Dialer,
     request: DownloadRequest,
     tx: &mut mpsc::Sender<DownloadProgressItem>,
 ) -> Result<()> {
@@ -496,6 +506,8 @@ pub struct DownloaderBuilder {
     endpoint: Endpoint,
     alpn: Vec<u8>,
     pool_options: crate::util::connection_pool::Options,
+    transform: Option<Arc<dyn StreamTransform>>,
+    plain_fallback: Option<Duration>,
 }
 
 impl DownloaderBuilder {
@@ -509,23 +521,163 @@ impl DownloaderBuilder {
     }
 
     /// Sets the options for the connection pool used to connect to providers.
+    ///
+    /// With [`Self::plain_fallback`], the fallback pool uses the same options.
     pub fn pool_options(mut self, pool_options: crate::util::connection_pool::Options) -> Self {
         self.pool_options = pool_options;
+        self
+    }
+
+    /// Wraps every stream to a provider with `transform`.
+    ///
+    /// Providers must serve the blobs protocol with the same transform on the
+    /// ALPN set by [`Self::alpn`], e.g. with a
+    /// [`TransformedBlobsProtocol`](crate::transport::TransformedBlobsProtocol).
+    /// The request semantics, the local-aware resume, the provider walk and the
+    /// progress events are unchanged; `Progress` and `BytesTransferred` count
+    /// payload after the transform is undone.
+    pub fn stream_transform(mut self, transform: Arc<dyn StreamTransform>) -> Self {
+        self.transform = Some(transform);
+        self
+    }
+
+    /// Falls back to the plain blobs protocol for providers that refuse the
+    /// ALPN set by [`Self::alpn`].
+    ///
+    /// When the TLS handshake fails because the provider serves none of the
+    /// offered ALPNs (alert 120, `no_application_protocol`), the same provider
+    /// is retried on [`crate::ALPN`] with plain streams, and
+    /// [`DownloadProgressItem::PlainFallback`] is emitted. The refusal is
+    /// remembered for `ttl`, during which that provider is dialed on the plain
+    /// ALPN directly. Any other connect failure is reported as before.
+    ///
+    /// Without this, a refusing provider is reported as
+    /// [`DownloadProgressItem::ProviderFailed`].
+    pub fn plain_fallback(mut self, ttl: Duration) -> Self {
+        self.plain_fallback = Some(ttl);
         self
     }
 
     /// Spawns the downloader.
     pub fn build(self) -> Downloader {
         let (tx, rx) = tokio::sync::mpsc::channel::<SwarmMsg>(32);
-        let actor = DownloaderActor::new_with_opts(
-            self.store,
-            self.endpoint,
-            &self.alpn,
-            self.pool_options,
-        );
+        let fallback = self.plain_fallback.map(|ttl| PlainFallback {
+            pool: ConnectionPool::new(
+                self.endpoint.clone(),
+                crate::ALPN,
+                self.pool_options.clone(),
+            ),
+            ttl,
+            refused: Default::default(),
+        });
+        let dialer = Dialer {
+            primary: ConnectionPool::new(self.endpoint, &self.alpn, self.pool_options),
+            transform: self.transform,
+            fallback,
+        };
+        let actor = DownloaderActor::new(self.store, dialer);
         n0_future::task::spawn(actor.run(rx));
         Downloader { client: tx.into() }
     }
+}
+
+/// Connects to providers for the downloader: on the downloader's ALPN, with
+/// its optional stream transform, and with the optional plain fallback.
+#[derive(Debug, Clone)]
+struct Dialer {
+    primary: ConnectionPool,
+    transform: Option<Arc<dyn StreamTransform>>,
+    fallback: Option<PlainFallback>,
+}
+
+#[derive(Debug, Clone)]
+struct PlainFallback {
+    pool: ConnectionPool,
+    ttl: Duration,
+    /// Providers that refused the primary ALPN, until the given instant.
+    refused: Arc<std::sync::Mutex<HashMap<EndpointId, Instant>>>,
+}
+
+impl PlainFallback {
+    fn is_refused(&self, id: EndpointId) -> bool {
+        let mut refused = self.refused.lock().expect("poisoned");
+        let now = Instant::now();
+        refused.retain(|_, until| *until > now);
+        refused.contains_key(&id)
+    }
+
+    fn remember_refused(&self, id: EndpointId) {
+        let until = Instant::now() + self.ttl;
+        self.refused.lock().expect("poisoned").insert(id, until);
+    }
+}
+
+/// A connection handed out by [`Dialer::connect`].
+struct Dialed {
+    conn: ConnectionRef,
+    /// The transform to apply to this connection's streams.
+    transform: Option<Arc<dyn StreamTransform>>,
+    /// `Some(cached)` when this is a plain fallback connection.
+    fallback: Option<bool>,
+}
+
+impl Dialer {
+    async fn connect(&self, id: EndpointId) -> std::result::Result<Dialed, PoolConnectError> {
+        let Some(fallback) = &self.fallback else {
+            return Ok(Dialed {
+                conn: self.primary.get_or_connect(id).await?,
+                transform: self.transform.clone(),
+                fallback: None,
+            });
+        };
+        if fallback.is_refused(id) {
+            return Ok(Dialed {
+                conn: fallback.pool.get_or_connect(id).await?,
+                transform: None,
+                fallback: Some(true),
+            });
+        }
+        match self.primary.get_or_connect(id).await {
+            Ok(conn) => Ok(Dialed {
+                conn,
+                transform: self.transform.clone(),
+                fallback: None,
+            }),
+            Err(cause) if refused_alpn(&cause) => {
+                tracing::debug!(%id, "provider refused the downloader ALPN; falling back to plain");
+                fallback.remember_refused(id);
+                Ok(Dialed {
+                    conn: fallback.pool.get_or_connect(id).await?,
+                    transform: None,
+                    fallback: Some(false),
+                })
+            }
+            Err(cause) => Err(cause),
+        }
+    }
+}
+
+/// Whether a connect failed because the peer serves none of the offered ALPNs
+/// (TLS alert 120, `no_application_protocol`).
+fn refused_alpn(err: &PoolConnectError) -> bool {
+    use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError, TransportErrorCode};
+    const NO_APPLICATION_PROTOCOL: u8 = 120;
+    let PoolConnectError::ConnectError { source, .. } = err else {
+        return false;
+    };
+    let conn_err = match source.as_ref() {
+        ConnectError::Connection { source, .. } => source,
+        ConnectError::Connecting {
+            source: ConnectingError::ConnectionError { source, .. },
+            ..
+        } => source,
+        _ => return false,
+    };
+    matches!(
+        conn_err,
+        ConnectionError::ConnectionClosed(close)
+            if close.error_code == TransportErrorCode::crypto(NO_APPLICATION_PROTOCOL)
+    )
 }
 
 impl Downloader {
@@ -540,6 +692,8 @@ impl Downloader {
             endpoint: endpoint.clone(),
             alpn: crate::ALPN.to_vec(),
             pool_options: Default::default(),
+            transform: None,
+            plain_fallback: None,
         }
     }
 
@@ -594,7 +748,7 @@ impl Downloader {
 async fn split_request<'a>(
     request: &'a FiniteRequest,
     providers: &Arc<dyn ContentDiscovery>,
-    pool: &ConnectionPool,
+    pool: &Dialer,
     store: &Store,
     idle_timeout: Option<Duration>,
     progress: impl Sink<DownloadProgressItem, Error = irpc::channel::SendError>,
@@ -674,7 +828,7 @@ async fn send_bytes_transferred(
 /// reported as [`DownloadProgressItem::ProviderFailed`] and the next provider
 /// is tried; without it, a provider that stalls blocks the walk.
 async fn execute_get(
-    pool: &ConnectionPool,
+    pool: &Dialer,
     request: Arc<GetRequest>,
     providers: &Arc<dyn ContentDiscovery>,
     store: &Store,
@@ -684,7 +838,7 @@ async fn execute_get(
     let remote = store.remote();
     let mut providers = providers.find_providers(request.content());
     while let Some(provider) = providers.next().await {
-        let conn = pool.get_or_connect(provider);
+        let conn = pool.connect(provider);
         let local = remote.local_for_request(request.clone()).await?;
         if local.is_complete() {
             return Ok(());
@@ -699,7 +853,7 @@ async fn execute_get(
             })
             .await?;
         let local_bytes = local.local_bytes();
-        let Ok(conn) = conn.await else {
+        let Ok(dialed) = conn.await else {
             progress
                 .send(DownloadProgressItem::ProviderFailed {
                     id: provider,
@@ -708,6 +862,15 @@ async fn execute_get(
                 .await?;
             continue;
         };
+        if let Some(cached) = dialed.fallback {
+            progress
+                .send(DownloadProgressItem::PlainFallback {
+                    id: provider,
+                    cached,
+                })
+                .await?;
+        }
+        let conn: &iroh::endpoint::Connection = &dialed.conn;
         // Raw per-attempt payload counter, kept so a *failed* attempt can still
         // report the bytes it did transfer. On success we use the exact figure
         // from the returned stats instead of the last progress update.
@@ -718,18 +881,28 @@ async fn execute_get(
         let started = Instant::now();
         let last_progress_ms = Arc::new(AtomicU64::new(0));
         let progress_clock = last_progress_ms.clone();
-        let attempt = remote.execute_get_sink(
-            conn.clone(),
-            local.missing(),
-            (&mut progress).with_map(move |x| {
-                attempt_counter.store(x, Ordering::Relaxed);
-                progress_clock.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-                DownloadProgressItem::Progress(x + local_bytes)
-            }),
-        );
-        let outcome = match idle_timeout {
-            None => Ok(attempt.await),
-            Some(idle) => stall_guard(attempt, started, &last_progress_ms, idle).await,
+        let on_progress = move |x| {
+            attempt_counter.store(x, Ordering::Relaxed);
+            progress_clock.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            DownloadProgressItem::Progress(x + local_bytes)
+        };
+        let outcome = match &dialed.transform {
+            None => {
+                let attempt = remote.execute_get_sink(
+                    conn.clone(),
+                    local.missing(),
+                    (&mut progress).with_map(on_progress),
+                );
+                guard_attempt(attempt, idle_timeout, started, &last_progress_ms).await
+            }
+            Some(transform) => {
+                let attempt = remote.execute_get_sink(
+                    TransformedConnection::new(conn.clone(), transform.clone()),
+                    local.missing(),
+                    (&mut progress).with_map(on_progress),
+                );
+                guard_attempt(attempt, idle_timeout, started, &last_progress_ms).await
+            }
         };
         match outcome.and_then(|res| res.map_err(|_cause| ())) {
             Ok(stats) => {
@@ -755,6 +928,19 @@ async fn execute_get(
         }
     }
     Err(anyerr!("Unable to download {}", request.hash))
+}
+
+/// Run one provider attempt, under the stall guard if `idle_timeout` is set.
+async fn guard_attempt<T>(
+    attempt: impl Future<Output = T>,
+    idle_timeout: Option<Duration>,
+    started: Instant,
+    last_progress_ms: &AtomicU64,
+) -> std::result::Result<T, ()> {
+    match idle_timeout {
+        None => Ok(attempt.await),
+        Some(idle) => stall_guard(attempt, started, last_progress_ms, idle).await,
+    }
 }
 
 /// Run one provider attempt, abandoning it once `idle` passes with no payload
@@ -1079,6 +1265,7 @@ mod tests {
         completed: usize,
         bytes: u64,
         errors: usize,
+        fallbacks: Vec<(EndpointId, bool)>,
     }
 
     async fn collect(
@@ -1095,6 +1282,9 @@ mod tests {
                     out.errors += 1
                 }
                 DownloadProgressItem::Progress(_) => {}
+                DownloadProgressItem::PlainFallback { id, cached } => {
+                    out.fallbacks.push((id, cached))
+                }
             }
         }
         out
