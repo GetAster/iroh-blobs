@@ -29,6 +29,8 @@
 //!
 //! - `fs-store`: Enables the filesystem based store implementation. This comes with a few additional dependencies such as `redb` and `reflink-copy`.
 //! - `metrics`: Enables prometheus metrics for stores and the protocol.
+//! - `zstd`: Enables the zstd [stream transform](transport::zstd), which serves and
+//!   fetches blobs over zstd-compressed streams on a separate ALPN.
 //!
 //! [BLAKE3]: https://github.com/BLAKE3-team/BLAKE3-specs/blob/master/blake3.pdf
 //! [iroh]: https://docs.rs/iroh
@@ -46,6 +48,7 @@ pub use net_protocol::BlobsProtocol;
 pub mod protocol;
 pub mod provider;
 pub mod ticket;
+pub mod transport;
 
 #[doc(hidden)]
 pub mod test;
