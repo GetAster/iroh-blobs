@@ -615,6 +615,8 @@ impl PlainFallback {
 /// A connection handed out by [`Dialer::connect`].
 struct Dialed {
     conn: ConnectionRef,
+    /// The pool that handed out `conn`.
+    pool: ConnectionPool,
     /// The transform to apply to this connection's streams.
     transform: Option<Arc<dyn StreamTransform>>,
     /// `Some(cached)` when this is a plain fallback connection.
@@ -626,6 +628,7 @@ impl Dialer {
         let Some(fallback) = &self.fallback else {
             return Ok(Dialed {
                 conn: self.primary.get_or_connect(id).await?,
+                pool: self.primary.clone(),
                 transform: self.transform.clone(),
                 fallback: None,
             });
@@ -633,6 +636,7 @@ impl Dialer {
         if fallback.is_refused(id) {
             return Ok(Dialed {
                 conn: fallback.pool.get_or_connect(id).await?,
+                pool: fallback.pool.clone(),
                 transform: None,
                 fallback: Some(true),
             });
@@ -640,6 +644,7 @@ impl Dialer {
         match self.primary.get_or_connect(id).await {
             Ok(conn) => Ok(Dialed {
                 conn,
+                pool: self.primary.clone(),
                 transform: self.transform.clone(),
                 fallback: None,
             }),
@@ -648,6 +653,7 @@ impl Dialer {
                 fallback.remember_refused(id);
                 Ok(Dialed {
                     conn: fallback.pool.get_or_connect(id).await?,
+                    pool: fallback.pool.clone(),
                     transform: None,
                     fallback: Some(false),
                 })
@@ -655,6 +661,26 @@ impl Dialer {
             Err(cause) => Err(cause),
         }
     }
+}
+
+impl Dialed {
+    /// Stops the pool from handing out this connection again, so the next
+    /// connect to the provider dials anew.
+    async fn retire(&self) {
+        // Fails only once the pool has shut down, and then there is nothing to retire.
+        self.pool.retire(&self.conn).await.ok();
+    }
+}
+
+/// Whether the connection died under an attempt: the peer reset it (a restart
+/// on the same address), it timed out, or this side closed it, for example
+/// because a concurrent attempt retired it.
+fn connection_lost(conn: &iroh::endpoint::Connection) -> bool {
+    use iroh::endpoint::ConnectionError;
+    matches!(
+        conn.close_reason(),
+        Some(ConnectionError::Reset | ConnectionError::TimedOut | ConnectionError::LocallyClosed)
+    )
 }
 
 /// Whether a connect failed because the peer serves none of the offered ALPNs
@@ -827,6 +853,14 @@ async fn send_bytes_transferred(
 /// With `idle_timeout`, an attempt that delivers no payload for that long is
 /// reported as [`DownloadProgressItem::ProviderFailed`] and the next provider
 /// is tried; without it, a provider that stalls blocks the walk.
+///
+/// With `idle_timeout`, an attempt whose connection is lost is also retried
+/// once on a fresh connection to the same provider before moving on, and the
+/// pool stops handing out the lost connection. Lost means the connection
+/// closed by reset, idle timeout or locally, or the provider did not
+/// acknowledge anything within [`silence_bound`] of the request (it died
+/// without closing, for example to restart on another address). Each try is
+/// reported with its own [`DownloadProgressItem::TryProvider`].
 async fn execute_get(
     pool: &Dialer,
     request: Arc<GetRequest>,
@@ -837,7 +871,17 @@ async fn execute_get(
 ) -> Result<()> {
     let remote = store.remote();
     let mut providers = providers.find_providers(request.content());
-    while let Some(provider) = providers.next().await {
+    // A provider to try again on a fresh connection, and the last one retried.
+    let mut retry: Option<EndpointId> = None;
+    let mut retried: Option<EndpointId> = None;
+    loop {
+        let provider = match retry.take() {
+            Some(provider) => provider,
+            None => match providers.next().await {
+                Some(provider) => provider,
+                None => break,
+            },
+        };
         let conn = pool.connect(provider);
         let local = remote.local_for_request(request.clone()).await?;
         if local.is_complete() {
@@ -871,6 +915,10 @@ async fn execute_get(
                 .await?;
         }
         let conn: &iroh::endpoint::Connection = &dialed.conn;
+        // Datagrams received before the request goes out. The provider must
+        // acknowledge the request, so if this has not moved within the
+        // silence bound, nothing is answering on this connection.
+        let received = conn.stats().udp_rx.datagrams;
         // Raw per-attempt payload counter, kept so a *failed* attempt can still
         // report the bytes it did transfer. On success we use the exact figure
         // from the returned stats instead of the last progress update.
@@ -893,7 +941,15 @@ async fn execute_get(
                     local.missing(),
                     (&mut progress).with_map(on_progress),
                 );
-                guard_attempt(attempt, idle_timeout, started, &last_progress_ms).await
+                guard_attempt(
+                    attempt,
+                    idle_timeout,
+                    started,
+                    &last_progress_ms,
+                    conn,
+                    received,
+                )
+                .await
             }
             Some(transform) => {
                 let attempt = remote.execute_get_sink(
@@ -901,10 +957,22 @@ async fn execute_get(
                     local.missing(),
                     (&mut progress).with_map(on_progress),
                 );
-                guard_attempt(attempt, idle_timeout, started, &last_progress_ms).await
+                guard_attempt(
+                    attempt,
+                    idle_timeout,
+                    started,
+                    &last_progress_ms,
+                    conn,
+                    received,
+                )
+                .await
             }
         };
-        match outcome.and_then(|res| res.map_err(|_cause| ())) {
+        let silent = matches!(outcome, Err(Abandoned::Silent));
+        match outcome
+            .map_err(|_| ())
+            .and_then(|res| res.map_err(|_cause| ()))
+        {
             Ok(stats) => {
                 send_bytes_transferred(&mut progress, stats.payload_bytes_read).await?;
                 progress
@@ -915,6 +983,15 @@ async fn execute_get(
                 return Ok(());
             }
             Err(()) => {
+                let lost = idle_timeout.is_some() && (silent || connection_lost(conn));
+                if lost {
+                    tracing::debug!(%provider, silent, "connection to provider lost; retiring it");
+                    dialed.retire().await;
+                    if retried != Some(provider) {
+                        retried = Some(provider);
+                        retry = Some(provider);
+                    }
+                }
                 send_bytes_transferred(&mut progress, attempt_bytes.load(Ordering::Relaxed))
                     .await?;
                 progress
@@ -930,21 +1007,53 @@ async fn execute_get(
     Err(anyerr!("Unable to download {}", request.hash))
 }
 
+/// Why the stall guard abandoned a provider attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Abandoned {
+    /// No payload progress for the idle timeout.
+    Stalled,
+    /// The connection received nothing within [`silence_bound`] of the
+    /// request: the provider is gone, not slow.
+    Silent,
+}
+
+/// The least time to wait for the provider to acknowledge a request.
+const MIN_SILENCE: Duration = Duration::from_secs(1);
+
+/// How long a connection may receive nothing after a request before the
+/// provider counts as gone: four round trips on its slowest path, at least
+/// [`MIN_SILENCE`], at most the idle timeout.
+///
+/// A live QUIC peer acknowledges the request within a round trip plus its ACK
+/// delay even when the provider is slow to answer it.
+fn silence_bound(conn: &iroh::endpoint::Connection, idle: Duration) -> Duration {
+    let rtt = conn
+        .paths()
+        .iter()
+        .map(|path| path.rtt())
+        .max()
+        .unwrap_or_default();
+    (rtt * 4).max(MIN_SILENCE).min(idle)
+}
+
 /// Run one provider attempt, under the stall guard if `idle_timeout` is set.
 async fn guard_attempt<T>(
     attempt: impl Future<Output = T>,
     idle_timeout: Option<Duration>,
     started: Instant,
     last_progress_ms: &AtomicU64,
-) -> std::result::Result<T, ()> {
+    conn: &iroh::endpoint::Connection,
+    received: u64,
+) -> std::result::Result<T, Abandoned> {
     match idle_timeout {
         None => Ok(attempt.await),
-        Some(idle) => stall_guard(attempt, started, last_progress_ms, idle).await,
+        Some(idle) => stall_guard(attempt, started, last_progress_ms, idle, conn, received).await,
     }
 }
 
 /// Run one provider attempt, abandoning it once `idle` passes with no payload
-/// progress since `started` + `last_progress_ms`. `Err(())` means it stalled.
+/// progress since `started` + `last_progress_ms`, or once the connection has
+/// received no datagram since `received` was read for [`silence_bound`].
 ///
 /// The clock covers the whole attempt, including opening the stream and
 /// waiting for the first chunk, so a provider that accepts and never answers
@@ -954,7 +1063,16 @@ async fn stall_guard<T>(
     started: Instant,
     last_progress_ms: &AtomicU64,
     idle: Duration,
-) -> std::result::Result<T, ()> {
+    conn: &iroh::endpoint::Connection,
+    received: u64,
+) -> std::result::Result<T, Abandoned> {
+    let silence = async {
+        n0_future::time::sleep_until(started + silence_bound(conn, idle)).await;
+        if conn.stats().udp_rx.datagrams == received {
+            return;
+        }
+        future::pending::<()>().await
+    };
     let watchdog = async {
         loop {
             let last = Duration::from_millis(last_progress_ms.load(Ordering::Relaxed));
@@ -969,9 +1087,13 @@ async fn stall_guard<T>(
     tokio::select! {
         biased;
         res = attempt => Ok(res),
+        () = silence => {
+            tracing::debug!("provider acknowledged nothing since the request; connection lost");
+            Err(Abandoned::Silent)
+        }
         () = watchdog => {
             tracing::debug!(?idle, "provider attempt stalled; trying the next provider");
-            Err(())
+            Err(Abandoned::Stalled)
         }
     }
 }
@@ -1706,6 +1828,127 @@ mod tests {
         assert_eq!(reported.failed, vec![stalled.id; 3]);
         assert_eq!(reported.completed, 3);
         assert_eq!(reported.bytes, expected_bytes);
+        Ok(())
+    }
+
+    /// Blob payloads served by [`restartable_provider`].
+    fn restart_blobs() -> [Vec<u8>; 2] {
+        [vec![1u8; 64 * 1024], vec![2u8; 64 * 1024]]
+    }
+
+    /// A loopback-only endpoint with relays off, like a restart probe.
+    fn loopback_endpoint() -> TestResult<iroh::endpoint::Builder> {
+        Ok(Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))?)
+    }
+
+    /// Serve [`restart_blobs`] as `key` on a fresh loopback port.
+    async fn restartable_provider(
+        key: iroh::SecretKey,
+    ) -> TestResult<(iroh::EndpointAddr, Router)> {
+        let store = MemStore::new();
+        for blob in restart_blobs() {
+            store.add_slice(blob).await?;
+        }
+        let ep = loopback_endpoint()?.secret_key(key).bind().await?;
+        let addr = iroh::EndpointAddr::new(ep.id()).with_ip_addr(ep.bound_sockets()[0]);
+        let blobs = BlobsProtocol::new(&store, None);
+        let router = Router::builder(ep).accept(crate::ALPN, blobs).spawn();
+        // The store lives as long as the router's protocol handler.
+        Ok((addr, router))
+    }
+
+    /// A provider that dies without CONNECTION_CLOSE and comes back with the
+    /// same key on a new port. Nothing answers the old port, so the pooled
+    /// connection stays open until QUIC's 30 s idle timeout. The next fetch
+    /// must find the connection lost, retire it, and fetch over a fresh one
+    /// within a few seconds, not stall for the provider idle timeout.
+    #[tokio::test]
+    async fn downloader_recovers_from_a_provider_restarted_on_a_new_port() -> TestResult<()> {
+        use crate::util::connection_pool::Options;
+        /// Aster's provider idle timeout.
+        const PROVIDER_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+        const PROMPTLY: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let key = iroh::SecretKey::generate();
+        let [blob_a, blob_b] = restart_blobs().map(|b| Hash::new(&b));
+
+        // The old provider runs in its own runtime, so it can vanish without
+        // sending CONNECTION_CLOSE: shutting the runtime down drops every task
+        // without polling it again, like kill -9.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+        let old = {
+            let key = key.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("runtime");
+                let router = rt.block_on(async move {
+                    let (addr, router) = restartable_provider(key).await.expect("provider");
+                    ready_tx.send(addr).expect("ready");
+                    kill_rx.await.ok();
+                    router
+                });
+                rt.shutdown_timeout(std::time::Duration::from_secs(2));
+                drop(router);
+            })
+        };
+        let old_addr = ready_rx.await?;
+
+        let lookup = iroh::address_lookup::MemoryLookup::new();
+        lookup.add_endpoint_info(old_addr.clone());
+        let ep = loopback_endpoint()?
+            .address_lookup(lookup.clone())
+            .bind()
+            .await?;
+        let store = MemStore::new();
+        let swarm = Downloader::builder(&store, &ep)
+            .pool_options(Options {
+                idle_timeout: std::time::Duration::from_secs(120),
+                ..Default::default()
+            })
+            .build();
+        let fetch = |hash: Hash| {
+            swarm.download_with_opts(
+                DownloadOptions::new(hash, [old_addr.id], SplitStrategy::None)
+                    .with_provider_idle_timeout(PROVIDER_IDLE),
+            )
+        };
+
+        // Fetch one blob, which leaves a pooled connection to the provider.
+        let first = collect(fetch(blob_a).stream().await?).await;
+        assert_eq!(first.errors, 0, "first fetch: {first:?}");
+        assert!(store.has(blob_a).await?);
+
+        kill_tx.send(()).ok();
+        tokio::task::spawn_blocking(move || old.join().expect("old provider")).await?;
+
+        // Same key, new port.
+        let (new_addr, _new) = restartable_provider(key).await?;
+        assert_ne!(new_addr, old_addr, "restarted on the same port");
+        lookup.add_endpoint_info(new_addr);
+
+        let start = std::time::Instant::now();
+        let stream = fetch(blob_b).stream().await?;
+        let second = tokio::time::timeout(PROVIDER_IDLE * 3, collect(stream)).await?;
+        let elapsed = start.elapsed();
+        println!("fetch after restart: {elapsed:?} {second:?}");
+        assert_eq!(second.errors, 0, "fetch after restart failed: {second:?}");
+        assert!(store.has(blob_b).await?);
+        assert!(
+            elapsed < PROMPTLY,
+            "fetch after restart took {elapsed:?}, waiting on the dead pooled connection"
+        );
+        // One try on the dead pooled connection, one on a fresh one.
+        assert_eq!(second.tried, vec![old_addr.id; 2]);
+        assert_eq!(second.failed, vec![old_addr.id]);
+
+        // The fresh connection is pooled and reused.
+        let start = std::time::Instant::now();
+        let third = collect(fetch(blob_a).stream().await?).await;
+        assert_eq!(third.errors, 0);
+        assert!(start.elapsed() < PROMPTLY);
         Ok(())
     }
 }
