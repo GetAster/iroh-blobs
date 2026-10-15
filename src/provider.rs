@@ -3,7 +3,7 @@
 //! Note that while using this API directly is fine, the standard way
 //! to provide data is to just register a [`crate::BlobsProtocol`] protocol
 //! handler with an [`iroh::Endpoint`](iroh::protocol::Router).
-use std::{fmt::Debug, future::Future, io};
+use std::{fmt::Debug, future::Future, io, sync::Arc};
 
 use bao_tree::ChunkRanges;
 use iroh::endpoint::{self, ConnectionError, VarInt};
@@ -30,6 +30,7 @@ use crate::{
         ClientConnected, ClientResult, ConnectionClosed, HasErrorCode, ProgressError,
         RequestTracker,
     },
+    transport::StreamTransform,
     util::{RecvStream, RecvStreamExt, SendStream, SendStreamExt},
     Hash,
 };
@@ -303,6 +304,51 @@ pub async fn handle_connection(
             return;
         }
         while let Ok(pair) = StreamPair::accept(&connection, progress.clone()).await {
+            let span = debug_span!("stream", stream_id = %pair.stream_id());
+            let store = store.clone();
+            n0_future::task::spawn(handle_stream(pair, store).instrument(span));
+        }
+        progress
+            .connection_closed(|| ConnectionClosed { connection_id })
+            .await
+            .ok();
+    }
+    .instrument(span)
+    .await
+}
+
+/// Handle a single connection whose streams are wrapped by `transform`.
+///
+/// Identical to [`handle_connection`] except that each accepted stream pair is
+/// wrapped before the request is read, so the same provider events and request
+/// handling apply. Used by [`crate::transport::TransformedBlobsProtocol`].
+pub async fn handle_connection_with_transform(
+    connection: endpoint::Connection,
+    store: Store,
+    progress: EventSender,
+    transform: Arc<dyn StreamTransform>,
+) {
+    let connection_id = connection.stable_id() as u64;
+    let span = debug_span!("connection", connection_id);
+    async move {
+        if let Err(cause) = progress
+            .client_connected(|| ClientConnected {
+                connection_id,
+                endpoint_id: Some(connection.remote_id()),
+            })
+            .await
+        {
+            connection.close(cause.code(), cause.reason());
+            debug!("closing connection: {cause}");
+            return;
+        }
+        while let Ok((writer, reader)) = connection.accept_bi().await {
+            let pair = StreamPair::new(
+                connection_id,
+                transform.recv_stream(reader),
+                transform.send_stream(writer),
+                progress.clone(),
+            );
             let span = debug_span!("stream", stream_id = %pair.stream_id());
             let store = store.clone();
             n0_future::task::spawn(handle_stream(pair, store).instrument(span));
@@ -667,6 +713,10 @@ async fn send_observe_item<W: SendStream>(
 ) -> io::Result<()> {
     let item = ObserveItem::from(item);
     let len = writer.inner.write_length_prefixed(item).await?;
+    // Observe updates are sent as they happen, not at the end of a response,
+    // so make each one visible to the peer now. A no-op on plain streams; a
+    // buffering stream transform (compression) would otherwise hold updates.
+    writer.inner.sync().await?;
     writer.context.log_other_write(len);
     Ok(())
 }
