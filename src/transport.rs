@@ -18,7 +18,16 @@
 //!   it to [`Remote::fetch`](crate::api::remote::Remote::fetch).
 //!
 //! The `zstd` feature provides [`zstd::ZstdTransform`].
-use std::{fmt::Debug, future::Future, io, pin::Pin, sync::Arc};
+use std::{
+    fmt::Debug,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use bytes::Bytes;
 use iroh::{
@@ -173,6 +182,62 @@ impl RecvStream for BoxedRecvStream {
     }
 }
 
+/// Byte counters for one use of a connection's transformed streams, for
+/// example one downloader attempt against one provider.
+///
+/// A transform's own counters (such as the zstd transform's `ZstdStats`)
+/// cover every stream it wraps. A tally covers
+/// only the streams it was passed to, through
+/// [`StreamTransform::send_stream_tallied`] /
+/// [`StreamTransform::recv_stream_tallied`], so traffic can be attributed to
+/// one provider while the transform is shared. Transforms that keep no
+/// counters leave it at zero.
+#[derive(Debug, Default)]
+pub struct StreamTally {
+    wire_bytes_written: AtomicU64,
+    plain_bytes_written: AtomicU64,
+    wire_bytes_read: AtomicU64,
+    plain_bytes_read: AtomicU64,
+}
+
+/// A snapshot of a [`StreamTally`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StreamTallySnapshot {
+    /// Transformed bytes handed to QUIC.
+    pub wire_bytes_written: u64,
+    /// Protocol bytes those were produced from.
+    pub plain_bytes_written: u64,
+    /// Transformed bytes read from QUIC.
+    pub wire_bytes_read: u64,
+    /// Protocol bytes those were turned into.
+    pub plain_bytes_read: u64,
+}
+
+impl StreamTally {
+    /// Count `wire` transformed bytes handed to QUIC, made from `plain`
+    /// protocol bytes. Either may be zero, for a transform that buffers.
+    pub fn record_written(&self, wire: u64, plain: u64) {
+        self.wire_bytes_written.fetch_add(wire, Ordering::Relaxed);
+        self.plain_bytes_written.fetch_add(plain, Ordering::Relaxed);
+    }
+
+    /// Count `wire` transformed bytes read from QUIC and `plain` protocol
+    /// bytes produced. Either may be zero, for a transform that buffers.
+    pub fn record_read(&self, wire: u64, plain: u64) {
+        self.wire_bytes_read.fetch_add(wire, Ordering::Relaxed);
+        self.plain_bytes_read.fetch_add(plain, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> StreamTallySnapshot {
+        StreamTallySnapshot {
+            wire_bytes_written: self.wire_bytes_written.load(Ordering::Relaxed),
+            plain_bytes_written: self.plain_bytes_written.load(Ordering::Relaxed),
+            wire_bytes_read: self.wire_bytes_read.load(Ordering::Relaxed),
+            plain_bytes_read: self.plain_bytes_read.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Wraps both halves of each QUIC stream of a blobs connection.
 ///
 /// Both peers of a connection must use the same transform, which is why a
@@ -193,6 +258,28 @@ pub trait StreamTransform: Debug + Send + Sync + 'static {
     fn send_stream(&self, stream: iroh::endpoint::SendStream) -> BoxedSendStream;
     /// Wrap the receiving half of a stream.
     fn recv_stream(&self, stream: iroh::endpoint::RecvStream) -> BoxedRecvStream;
+
+    /// Wrap the sending half of a stream, also counting its bytes into
+    /// `tally`. The default ignores the tally.
+    fn send_stream_tallied(
+        &self,
+        stream: iroh::endpoint::SendStream,
+        tally: Arc<StreamTally>,
+    ) -> BoxedSendStream {
+        let _ = tally;
+        self.send_stream(stream)
+    }
+
+    /// Wrap the receiving half of a stream, also counting its bytes into
+    /// `tally`. The default ignores the tally.
+    fn recv_stream_tallied(
+        &self,
+        stream: iroh::endpoint::RecvStream,
+        tally: Arc<StreamTally>,
+    ) -> BoxedRecvStream {
+        let _ = tally;
+        self.recv_stream(stream)
+    }
 }
 
 /// A connection whose streams are wrapped by a [`StreamTransform`].
@@ -203,6 +290,7 @@ pub trait StreamTransform: Debug + Send + Sync + 'static {
 pub struct TransformedConnection {
     connection: Connection,
     transform: Arc<dyn StreamTransform>,
+    tally: Option<Arc<StreamTally>>,
 }
 
 impl TransformedConnection {
@@ -210,7 +298,15 @@ impl TransformedConnection {
         Self {
             connection,
             transform,
+            tally: None,
         }
+    }
+
+    /// Also count the bytes of the streams opened through this value into
+    /// `tally`, besides the transform's own counters.
+    pub fn with_tally(mut self, tally: Arc<StreamTally>) -> Self {
+        self.tally = Some(tally);
+        self
     }
 }
 
@@ -218,11 +314,17 @@ impl GetStreamPair for TransformedConnection {
     async fn open_stream_pair(self) -> io::Result<StreamPair<impl RecvStream, impl SendStream>> {
         let connection_id = self.connection.stable_id() as u64;
         let (send, recv) = self.connection.open_bi().await?;
-        Ok(StreamPair::new(
-            connection_id,
-            self.transform.recv_stream(recv),
-            self.transform.send_stream(send),
-        ))
+        let (recv, send) = match self.tally {
+            None => (
+                self.transform.recv_stream(recv),
+                self.transform.send_stream(send),
+            ),
+            Some(tally) => (
+                self.transform.recv_stream_tallied(recv, tally.clone()),
+                self.transform.send_stream_tallied(send, tally),
+            ),
+        };
+        Ok(StreamPair::new(connection_id, recv, send))
     }
 }
 

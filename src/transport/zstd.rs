@@ -23,7 +23,7 @@ use bytes::Bytes;
 use iroh::endpoint::VarInt;
 use zstd::stream::raw::{CParameter, DParameter, Decoder, Encoder, InBuffer, Operation, OutBuffer};
 
-use super::{BoxedRecvStream, BoxedSendStream, StreamTransform};
+use super::{BoxedRecvStream, BoxedSendStream, StreamTally, StreamTransform};
 use crate::util::{RecvStream, SendStream};
 
 /// ALPN for the blobs protocol ([`crate::ALPN`]) over zstd-compressed streams.
@@ -132,6 +132,24 @@ impl StreamTransform for ZstdTransform {
     fn recv_stream(&self, stream: iroh::endpoint::RecvStream) -> BoxedRecvStream {
         BoxedRecvStream::new(ZstdRecvStream::new(stream, self.stats.clone()))
     }
+
+    fn send_stream_tallied(
+        &self,
+        stream: iroh::endpoint::SendStream,
+        tally: Arc<StreamTally>,
+    ) -> BoxedSendStream {
+        BoxedSendStream::new(
+            ZstdSendStream::new(stream, self.level, self.stats.clone()).with_tally(tally),
+        )
+    }
+
+    fn recv_stream_tallied(
+        &self,
+        stream: iroh::endpoint::RecvStream,
+        tally: Arc<StreamTally>,
+    ) -> BoxedRecvStream {
+        BoxedRecvStream::new(ZstdRecvStream::new(stream, self.stats.clone()).with_tally(tally))
+    }
 }
 
 fn zstd_error(e: io::Error) -> io::Error {
@@ -147,6 +165,8 @@ pub struct ZstdSendStream<W = iroh::endpoint::SendStream> {
     /// Whether the current frame has input that `sync` has not ended yet.
     frame_open: bool,
     stats: Arc<ZstdStats>,
+    /// Counters of this stream's use, besides the transform's shared ones.
+    tally: Option<Arc<StreamTally>>,
 }
 
 impl<W: SendStream> ZstdSendStream<W> {
@@ -158,7 +178,14 @@ impl<W: SendStream> ZstdSendStream<W> {
             out: Vec::new(),
             frame_open: false,
             stats,
+            tally: None,
         }
+    }
+
+    /// Also count this stream's bytes into `tally`.
+    pub fn with_tally(mut self, tally: Arc<StreamTally>) -> Self {
+        self.tally = Some(tally);
+        self
     }
 
     fn encoder(level: i32) -> Encoder<'static> {
@@ -180,6 +207,9 @@ impl<W: SendStream> ZstdSendStream<W> {
             self.stats
                 .wire_bytes_written
                 .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            if let Some(tally) = &self.tally {
+                tally.record_written(chunk.len() as u64, 0);
+            }
             self.inner.send_bytes(chunk).await?;
         }
         Ok(())
@@ -193,6 +223,9 @@ impl<W: SendStream> ZstdSendStream<W> {
         self.stats
             .plain_bytes_written
             .fetch_add(buf.len() as u64, Ordering::Relaxed);
+        if let Some(tally) = &self.tally {
+            tally.record_written(0, buf.len() as u64);
+        }
         let mut input = InBuffer::around(buf);
         while input.pos() < buf.len() {
             self.out.reserve(SEND_CHUNK);
@@ -278,6 +311,8 @@ pub struct ZstdRecvStream<R = iroh::endpoint::RecvStream> {
     /// A decode error has been reported; later reads repeat it.
     failed: bool,
     stats: Arc<ZstdStats>,
+    /// Counters of this stream's use, besides the transform's shared ones.
+    tally: Option<Arc<StreamTally>>,
 }
 
 impl<R: RecvStream> ZstdRecvStream<R> {
@@ -296,7 +331,14 @@ impl<R: RecvStream> ZstdRecvStream<R> {
             eof: false,
             failed: false,
             stats,
+            tally: None,
         }
+    }
+
+    /// Also count this stream's bytes into `tally`.
+    pub fn with_tally(mut self, tally: Arc<StreamTally>) -> Self {
+        self.tally = Some(tally);
+        self
     }
 
     fn fail(&mut self, e: io::Error) -> io::Error {
@@ -334,6 +376,9 @@ impl<R: RecvStream> ZstdRecvStream<R> {
                     self.stats
                         .wire_bytes_read
                         .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    if let Some(tally) = &self.tally {
+                        tally.record_read(chunk.len() as u64, 0);
+                    }
                     self.input = chunk;
                 }
                 continue;
@@ -362,6 +407,9 @@ impl<R: RecvStream> ZstdRecvStream<R> {
                 self.stats
                     .plain_bytes_read
                     .fetch_add(produced as u64, Ordering::Relaxed);
+                if let Some(tally) = &self.tally {
+                    tally.record_read(0, produced as u64);
+                }
                 return Ok(true);
             }
         }
@@ -429,7 +477,7 @@ impl<R> std::fmt::Debug for ZstdRecvStream<R> {
 
 #[cfg(test)]
 mod tests {
-    use std::{ops::Deref, sync::Arc, time::Duration};
+    use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
 
     use bao_tree::{ChunkNum, ChunkRanges};
     use bytes::Bytes;
@@ -442,8 +490,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        api::downloader::{DownloadOptions, DownloadProgressItem, Downloader, SplitStrategy},
+        api::downloader::{
+            AttemptStats, DownloadOptions, DownloadProgressItem, Downloader, SplitStrategy,
+        },
         protocol::GetRequest,
+        provider::events::{EventMask, EventSender, ProviderMessage, ThrottleMode},
         store::mem::MemStore,
         transport::{StreamTransform, TransformedBlobsProtocol},
         BlobsProtocol, HashAndFormat,
@@ -706,6 +757,8 @@ mod tests {
         failed: Vec<EndpointId>,
         completed: usize,
         bytes: u64,
+        /// Payload and wire bytes per provider, from `BytesTransferred`.
+        by_provider: HashMap<EndpointId, (u64, Option<u64>)>,
         errors: usize,
         fallbacks: Vec<(EndpointId, bool)>,
     }
@@ -728,7 +781,19 @@ mod tests {
                     DownloadProgressItem::TryProvider { id, .. } => out.tried.push(id),
                     DownloadProgressItem::ProviderFailed { id, .. } => out.failed.push(id),
                     DownloadProgressItem::PartComplete { .. } => out.completed += 1,
-                    DownloadProgressItem::BytesTransferred(n) => out.bytes += n,
+                    DownloadProgressItem::BytesTransferred {
+                        id,
+                        bytes,
+                        wire_bytes,
+                        ..
+                    } => {
+                        out.bytes += bytes;
+                        let entry = out.by_provider.entry(id).or_default();
+                        entry.0 += bytes;
+                        if let Some(wire) = wire_bytes {
+                            *entry.1.get_or_insert(0) += wire;
+                        }
+                    }
                     DownloadProgressItem::Error(_) | DownloadProgressItem::DownloadError => {
                         out.errors += 1
                     }
@@ -1103,6 +1168,190 @@ mod tests {
             consumer.store.get_bytes(tt.hash).await?.deref(),
             text.as_slice()
         );
+        Ok(())
+    }
+
+    /// 8 MiB of numbered text lines.
+    fn lines_blob() -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0u64;
+        while out.len() < 8 << 20 {
+            out.extend_from_slice(format!("line {i}: the quick brown fox jumps over\n").as_bytes());
+            i += 1;
+        }
+        out
+    }
+
+    /// Chunk groups a [`throttled_zstd`] provider lets through: 4 MiB, more
+    /// than the compressor buffers at the default level, so compressed
+    /// frames reach the wire before it stalls.
+    const ALLOWED_GROUPS: usize = 256;
+
+    /// A zstd provider of `data` that lets [`ALLOWED_GROUPS`] chunk groups
+    /// through and then holds every further one, with the connection alive.
+    async fn throttled_zstd(
+        data: &[u8],
+    ) -> TestResult<(Router, crate::Hash, tokio::task::JoinHandle<()>)> {
+        let store = MemStore::new();
+        let tt = store.add_slice(data).await?;
+        let (events, mut messages) = EventSender::channel(
+            8,
+            EventMask {
+                throttle: ThrottleMode::Intercept,
+                ..EventMask::DEFAULT
+            },
+        );
+        let gate = tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut allowed = 0;
+            while let Some(message) = messages.recv().await {
+                if let ProviderMessage::Throttle(message) = message {
+                    if allowed < ALLOWED_GROUPS {
+                        allowed += 1;
+                        message.tx.send(Ok(())).await.ok();
+                    } else {
+                        held.push(message);
+                    }
+                }
+            }
+        });
+        let lookup = MemoryLookup::new();
+        let router = Router::builder(endpoint(&lookup).await?)
+            .accept(
+                ZSTD_ALPN,
+                TransformedBlobsProtocol::new(
+                    &store,
+                    Some(events),
+                    Arc::new(ZstdTransform::default()),
+                ),
+            )
+            .spawn();
+        Ok((router, tt.hash, gate))
+    }
+
+    /// Wait until `read` is positive and has not moved for 200 ms.
+    async fn settled(read: impl Fn() -> u64) -> TestResult<u64> {
+        Ok(tokio::time::timeout(Duration::from_secs(30), async {
+            let mut last = 0;
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let now = read();
+                if now > 0 && now == last {
+                    return now;
+                }
+                last = now;
+            }
+        })
+        .await?)
+    }
+
+    /// Each provider of a zstd fetch is credited with the compressed bytes its
+    /// own attempt received, below the payload it decoded, and the per-provider
+    /// figures add up to the transform's node-wide counter. Here the first
+    /// provider dies after delivering part of the blob. A plain fallback
+    /// attempt reports no wire bytes.
+    #[tokio::test]
+    async fn zstd_wire_bytes_are_attributed_per_provider() -> TestResult<()> {
+        let text = lines_blob();
+        let (dying, hash, gate) = throttled_zstd(&text).await?;
+        let (holder, _) = zstd_node().await?;
+        holder.store.add_slice(&text).await?;
+        let plain = node(None).await?;
+        let other = plain.store.add_slice(b"plain only blob").await?;
+        let consumer = node(None).await?;
+        consumer.knows_router(&dying);
+        consumer.knows(&holder);
+        consumer.knows(&plain);
+
+        // Kill the first provider once the consumer has stored part of the
+        // blob from it.
+        let killer = {
+            let store = consumer.store.clone();
+            let dying = dying.clone();
+            tokio::spawn(async move {
+                let local = || {
+                    let store = store.clone();
+                    async move {
+                        store
+                            .remote()
+                            .local(HashAndFormat::raw(hash))
+                            .await
+                            .map(|l| l.local_bytes())
+                            .unwrap_or(0)
+                    }
+                };
+                while local().await == 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                dying.shutdown().await.ok();
+            })
+        };
+        let client = ZstdTransform::default();
+        let d = zstd_downloader(&consumer, &client, true);
+        let r = fetch(&d, hash, vec![dying.endpoint().id(), holder.id()], None).await?;
+        killer.await?;
+        gate.abort();
+        assert_eq!(r.errors, 0, "{r:?}");
+        assert_eq!(r.failed, vec![dying.endpoint().id()]);
+        let (from_dying, dying_wire) = r.by_provider[&dying.endpoint().id()];
+        let (from_holder, holder_wire) = r.by_provider[&holder.id()];
+        assert!(from_dying > 0 && from_holder > 0, "{r:?}");
+        assert_eq!(from_dying + from_holder, text.len() as u64);
+        assert_eq!(r.bytes, text.len() as u64);
+        let (dying_wire, holder_wire) = (dying_wire.unwrap(), holder_wire.unwrap());
+        assert!(dying_wire > 0 && dying_wire < from_dying, "{r:?}");
+        assert!(holder_wire > 0 && holder_wire < from_holder, "{r:?}");
+        assert_eq!(
+            dying_wire + holder_wire,
+            client.stats().snapshot().wire_bytes_read
+        );
+        assert_eq!(
+            consumer.store.get_bytes(hash).await?.deref(),
+            text.as_slice()
+        );
+
+        let r = fetch(&d, other.hash, vec![plain.id()], None).await?;
+        assert_eq!(r.errors, 0, "{r:?}");
+        assert_eq!(r.fallbacks, vec![(plain.id(), false)]);
+        assert_eq!(
+            r.by_provider[&plain.id()],
+            (b"plain only blob".len() as u64, None)
+        );
+        Ok(())
+    }
+
+    /// A download dropped while its attempt is mid-transfer never reports
+    /// `BytesTransferred`; the attempt's live counters, handed out with
+    /// `TryProvider`, still show the payload and compressed bytes received.
+    #[tokio::test]
+    async fn zstd_attempt_stats_survive_a_cancelled_download() -> TestResult<()> {
+        let text = lines_blob();
+        let (stalling, hash, gate) = throttled_zstd(&text).await?;
+        let consumer = node(None).await?;
+        consumer.knows_router(&stalling);
+        let client = ZstdTransform::default();
+        let d = zstd_downloader(&consumer, &client, false);
+
+        let mut stream = d
+            .download(hash, vec![stalling.endpoint().id()])
+            .stream()
+            .await?;
+        let stats: AttemptStats = loop {
+            match tokio::time::timeout(Duration::from_secs(30), stream.next()).await? {
+                Some(DownloadProgressItem::TryProvider { stats, .. }) => break stats,
+                Some(_) => {}
+                None => panic!("the download ended"),
+            }
+        };
+        let payload = settled(|| stats.payload_bytes()).await?;
+        drop(stream);
+
+        assert_eq!(stats.payload_bytes(), payload);
+        assert!(payload < text.len() as u64, "{payload}");
+        let wire = stats.wire_bytes().expect("a zstd attempt");
+        assert!(wire > 0 && wire < payload, "wire {wire}, payload {payload}");
+        assert_eq!(wire, client.stats().snapshot().wire_bytes_read);
+        gate.abort();
         Ok(())
     }
 }
