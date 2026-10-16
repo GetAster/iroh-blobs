@@ -4,7 +4,7 @@ use std::{
     fmt::Debug,
     future::{Future, IntoFuture},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -29,7 +29,7 @@ use tracing::instrument::Instrument;
 use super::Store;
 use crate::{
     protocol::{GetManyRequest, GetRequest},
-    transport::{StreamTransform, TransformedConnection},
+    transport::{StreamTally, StreamTallySnapshot, StreamTransform, TransformedConnection},
     util::{
         connection_pool::{ConnectionPool, ConnectionRef, PoolConnectError},
         sink::{IrpcSenderRefSink, Sink, TokioMpscSenderSink},
@@ -61,13 +61,72 @@ struct DownloaderActor {
     idle_waiters: Vec<irpc::channel::oneshot::Sender<()>>,
 }
 
+/// Live byte counters of one provider attempt.
+///
+/// Handed out with the attempt's [`DownloadProgressItem::TryProvider`] and
+/// updated by the attempt as it runs. A consumer that stops reading the
+/// progress stream before the attempt's
+/// [`DownloadProgressItem::BytesTransferred`] (for example because it
+/// cancelled the download) can still read what the attempt received.
+///
+/// Clones share the counters. Not carried across an rpc boundary: there it
+/// reads zero.
+#[derive(Debug, Clone, Default)]
+pub struct AttemptStats(Arc<AttemptStatsInner>);
+
+#[derive(Debug, Default)]
+struct AttemptStatsInner {
+    payload_bytes: AtomicU64,
+    /// The attempt connected and runs over the downloader's stream transform.
+    transformed: AtomicBool,
+    tally: Arc<StreamTally>,
+}
+
+impl AttemptStats {
+    /// Payload bytes the attempt has decoded so far: the figure its
+    /// [`DownloadProgressItem::BytesTransferred`] reports once it ends.
+    pub fn payload_bytes(&self) -> u64 {
+        self.0.payload_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes the attempt's streams have received from the network so far,
+    /// before the stream transform decoded them. `None` while the attempt runs
+    /// over plain streams: no transform, a plain fallback, or not connected.
+    pub fn wire_bytes(&self) -> Option<u64> {
+        self.transform_tally().map(|t| t.wire_bytes_read)
+    }
+
+    /// All of the attempt's transformed-stream counters, in both directions.
+    /// `None` like [`Self::wire_bytes`].
+    pub fn transform_tally(&self) -> Option<StreamTallySnapshot> {
+        self.0
+            .transformed
+            .load(Ordering::Relaxed)
+            .then(|| self.0.tally.snapshot())
+    }
+
+    fn set_payload_bytes(&self, n: u64) {
+        self.0.payload_bytes.store(n, Ordering::Relaxed);
+    }
+
+    /// Mark the attempt as transformed and return the tally for its streams.
+    fn tally_for_transform(&self) -> Arc<StreamTally> {
+        self.0.transformed.store(true, Ordering::Relaxed);
+        self.0.tally.clone()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum DownloadProgressItem {
     #[serde(skip)]
     Error(n0_error::AnyError),
+    /// An attempt to fetch `request` from provider `id` starts.
     TryProvider {
         id: EndpointId,
         request: Arc<GetRequest>,
+        /// The attempt's live counters.
+        #[serde(skip)]
+        stats: AttemptStats,
     },
     ProviderFailed {
         id: EndpointId,
@@ -77,9 +136,18 @@ pub enum DownloadProgressItem {
         request: Arc<GetRequest>,
     },
     Progress(u64),
-    /// Payload bytes actually read from a provider during one attempt, emitted
-    /// once when that attempt ends (before its [`Self::PartComplete`] or
-    /// [`Self::ProviderFailed`]), and only when non-zero.
+    /// What one attempt read from provider `id` for `request`, emitted once
+    /// when that attempt ends (before its [`Self::PartComplete`] or
+    /// [`Self::ProviderFailed`]), and only when `bytes` or `wire_bytes` is
+    /// non-zero. The attempt's [`AttemptStats`] hold the same final figures.
+    ///
+    /// `bytes` is payload. `wire_bytes` is what the attempt's streams received
+    /// from the network before the downloader's stream transform decoded it
+    /// (compressed bytes, for zstd), or `None` when the attempt ran over plain
+    /// streams. A transform that keeps no counters reports `Some(0)`.
+    ///
+    /// The provider and request identify the attempt, so a consumer can credit
+    /// bytes per provider also when split children run concurrently.
     ///
     /// Unlike [`Self::Progress`], which is a cumulative offset that includes
     /// bytes already resident locally, these values are additive: summing them
@@ -93,7 +161,12 @@ pub enum DownloadProgressItem {
     /// failover resumes from what is already stored and so counts each byte
     /// once, but a range that was decoded and then failed to import locally is
     /// re-fetched and counted again.
-    BytesTransferred(u64),
+    BytesTransferred {
+        id: EndpointId,
+        request: Arc<GetRequest>,
+        bytes: u64,
+        wire_bytes: Option<u64>,
+    },
     DownloadError,
     /// The provider refused the downloader's ALPN, and the attempt continues
     /// over the plain blobs ALPN ([`crate::ALPN`]) with plain streams.
@@ -535,7 +608,9 @@ impl DownloaderBuilder {
     /// [`TransformedBlobsProtocol`](crate::transport::TransformedBlobsProtocol).
     /// The request semantics, the local-aware resume, the provider walk and the
     /// progress events are unchanged; `Progress` and `BytesTransferred` count
-    /// payload after the transform is undone.
+    /// payload after the transform is undone. Each attempt's streams are also
+    /// tallied on their own ([`StreamTransform::recv_stream_tallied`]), which
+    /// `BytesTransferred::wire_bytes` and [`AttemptStats`] report per provider.
     pub fn stream_transform(mut self, transform: Arc<dyn StreamTransform>) -> Self {
         self.transform = Some(transform);
         self
@@ -824,14 +899,23 @@ async fn split_request<'a>(
     })
 }
 
-/// Emit the payload total for one provider attempt, skipping the zero case.
+/// Emit the final counters of one provider attempt, skipping the zero case.
 async fn send_bytes_transferred(
     mut progress: impl Sink<DownloadProgressItem, Error = irpc::channel::SendError>,
-    bytes: u64,
+    id: EndpointId,
+    request: &Arc<GetRequest>,
+    stats: &AttemptStats,
 ) -> Result<()> {
-    if bytes > 0 {
+    let bytes = stats.payload_bytes();
+    let wire_bytes = stats.wire_bytes();
+    if bytes > 0 || wire_bytes.unwrap_or(0) > 0 {
         progress
-            .send(DownloadProgressItem::BytesTransferred(bytes))
+            .send(DownloadProgressItem::BytesTransferred {
+                id,
+                request: request.clone(),
+                bytes,
+                wire_bytes,
+            })
             .await?;
     }
     Ok(())
@@ -890,10 +974,12 @@ async fn execute_get(
         // Emitted only once we know there is something left to fetch, so
         // `TryProvider` means an actual transfer attempt rather than a no-op on
         // already-resident content.
+        let attempt = AttemptStats::default();
         progress
             .send(DownloadProgressItem::TryProvider {
                 id: provider,
                 request: request.clone(),
+                stats: attempt.clone(),
             })
             .await?;
         let local_bytes = local.local_bytes();
@@ -919,30 +1005,29 @@ async fn execute_get(
         // acknowledge the request, so if this has not moved within the
         // silence bound, nothing is answering on this connection.
         let received = conn.stats().udp_rx.datagrams;
-        // Raw per-attempt payload counter, kept so a *failed* attempt can still
-        // report the bytes it did transfer. On success we use the exact figure
-        // from the returned stats instead of the last progress update.
-        let attempt_bytes = Arc::new(AtomicU64::new(0));
-        let attempt_counter = attempt_bytes.clone();
+        // The live per-attempt payload counter lets a *failed* attempt still
+        // report the bytes it did transfer. On success the exact figure from
+        // the returned stats replaces the last progress update.
+        let attempt_counter = attempt.clone();
         // Milliseconds from `started` to the attempt's latest payload progress,
         // read by the stall guard.
         let started = Instant::now();
         let last_progress_ms = Arc::new(AtomicU64::new(0));
         let progress_clock = last_progress_ms.clone();
         let on_progress = move |x| {
-            attempt_counter.store(x, Ordering::Relaxed);
+            attempt_counter.set_payload_bytes(x);
             progress_clock.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
             DownloadProgressItem::Progress(x + local_bytes)
         };
         let outcome = match &dialed.transform {
             None => {
-                let attempt = remote.execute_get_sink(
+                let get = remote.execute_get_sink(
                     conn.clone(),
                     local.missing(),
                     (&mut progress).with_map(on_progress),
                 );
                 guard_attempt(
-                    attempt,
+                    get,
                     idle_timeout,
                     started,
                     &last_progress_ms,
@@ -952,13 +1037,14 @@ async fn execute_get(
                 .await
             }
             Some(transform) => {
-                let attempt = remote.execute_get_sink(
-                    TransformedConnection::new(conn.clone(), transform.clone()),
+                let get = remote.execute_get_sink(
+                    TransformedConnection::new(conn.clone(), transform.clone())
+                        .with_tally(attempt.tally_for_transform()),
                     local.missing(),
                     (&mut progress).with_map(on_progress),
                 );
                 guard_attempt(
-                    attempt,
+                    get,
                     idle_timeout,
                     started,
                     &last_progress_ms,
@@ -974,7 +1060,8 @@ async fn execute_get(
             .and_then(|res| res.map_err(|_cause| ()))
         {
             Ok(stats) => {
-                send_bytes_transferred(&mut progress, stats.payload_bytes_read).await?;
+                attempt.set_payload_bytes(stats.payload_bytes_read);
+                send_bytes_transferred(&mut progress, provider, &request, &attempt).await?;
                 progress
                     .send(DownloadProgressItem::PartComplete {
                         request: request.clone(),
@@ -992,8 +1079,7 @@ async fn execute_get(
                         retry = Some(provider);
                     }
                 }
-                send_bytes_transferred(&mut progress, attempt_bytes.load(Ordering::Relaxed))
-                    .await?;
+                send_bytes_transferred(&mut progress, provider, &request, &attempt).await?;
                 progress
                     .send(DownloadProgressItem::ProviderFailed {
                         id: provider,
@@ -1137,7 +1223,7 @@ impl ContentDiscovery for Shuffled {
 #[cfg(test)]
 #[cfg(feature = "fs-store")]
 mod tests {
-    use std::ops::Deref;
+    use std::{collections::HashMap, ops::Deref};
 
     use bao_tree::{ChunkNum, ChunkRanges};
     use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointId, RelayMode};
@@ -1386,20 +1472,46 @@ mod tests {
         failed: Vec<EndpointId>,
         completed: usize,
         bytes: u64,
+        /// Payload per provider, from `BytesTransferred`.
+        by_provider: HashMap<EndpointId, u64>,
+        /// Requests whose `BytesTransferred` named a provider other than the
+        /// one their `TryProvider` announced.
+        misattributed: usize,
         errors: usize,
         fallbacks: Vec<(EndpointId, bool)>,
+        /// Live counters of every attempt, by provider.
+        attempts: Vec<(EndpointId, super::AttemptStats)>,
+    }
+
+    impl Reported {
+        fn bytes_from(&self, id: EndpointId) -> u64 {
+            self.by_provider.get(&id).copied().unwrap_or(0)
+        }
     }
 
     async fn collect(
         mut stream: impl n0_future::Stream<Item = DownloadProgressItem> + Unpin,
     ) -> Reported {
         let mut out = Reported::default();
+        let mut active = HashMap::new();
         while let Some(item) = stream.next().await {
             match item {
-                DownloadProgressItem::TryProvider { id, .. } => out.tried.push(id),
+                DownloadProgressItem::TryProvider { id, request, stats } => {
+                    out.tried.push(id);
+                    active.insert(request, id);
+                    out.attempts.push((id, stats));
+                }
                 DownloadProgressItem::ProviderFailed { id, .. } => out.failed.push(id),
                 DownloadProgressItem::PartComplete { .. } => out.completed += 1,
-                DownloadProgressItem::BytesTransferred(n) => out.bytes += n,
+                DownloadProgressItem::BytesTransferred {
+                    id, request, bytes, ..
+                } => {
+                    out.bytes += bytes;
+                    *out.by_provider.entry(id).or_default() += bytes;
+                    if active.get(&request) != Some(&id) {
+                        out.misattributed += 1;
+                    }
+                }
                 DownloadProgressItem::Error(_) | DownloadProgressItem::DownloadError => {
                     out.errors += 1
                 }
@@ -1660,6 +1772,248 @@ mod tests {
             "partial provider {held}, total {}",
             data.len()
         );
+        // Each provider is credited with what its own attempt delivered, and
+        // the live counters end on the same figures, with no wire bytes for
+        // plain attempts.
+        assert_eq!(reported.misattributed, 0);
+        assert_eq!(
+            reported.bytes_from(partial.id) + reported.bytes_from(holder.id),
+            data.len() as u64
+        );
+        let live = reported
+            .attempts
+            .iter()
+            .map(|(id, stats)| (*id, stats.payload_bytes(), stats.wire_bytes()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            live,
+            vec![
+                (partial.id, reported.bytes_from(partial.id), None),
+                (holder.id, reported.bytes_from(holder.id), None)
+            ]
+        );
+        Ok(())
+    }
+
+    /// Split children run concurrently against different providers; every
+    /// `BytesTransferred` names the provider and request of its own attempt,
+    /// so bytes are credited per provider without relying on event order.
+    #[tokio::test]
+    async fn downloader_split_credits_bytes_per_provider() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("full")).await?;
+        let (r2, store2, _, _) = node_test_setup_fs(testdir.path().join("half")).await?;
+        let (r3, store3, _, sp3) = node_test_setup_fs(testdir.path().join("consumer")).await?;
+        let children = vec![vec![1u8; 100_000], vec![2u8; 30_000], vec![3u8; 7_000]];
+        let (root, expected_bytes) = add_collection(&store1, &children).await?;
+        // `half` has the root and the first child only.
+        let half_root = store2
+            .add_bytes_with_opts(AddBytesOptions {
+                data: store1.get_bytes(root).await?,
+                format: crate::BlobFormat::HashSeq,
+            })
+            .await?;
+        assert_eq!(half_root.hash, root);
+        store2.add_slice(children[0].clone()).await?;
+        let root_len = expected_bytes - children.iter().map(|c| c.len() as u64).sum::<u64>();
+        let full = r1.endpoint().addr();
+        let half = r2.endpoint().addr();
+        sp3.add_endpoint_info(full.clone());
+        sp3.add_endpoint_info(half.clone());
+        let swarm = Downloader::new(&store3, r3.endpoint());
+
+        let reported = collect(
+            swarm
+                .download_with_opts(DownloadOptions::new(
+                    GetRequest::all(root),
+                    [half.id, full.id],
+                    SplitStrategy::Split,
+                ))
+                .stream()
+                .await?,
+        )
+        .await;
+
+        assert_eq!(reported.errors, 0);
+        assert_eq!(reported.misattributed, 0);
+        // `half` serves the root and child 0 and fails children 1 and 2,
+        // which `full` serves.
+        assert_eq!(reported.failed, vec![half.id; 2]);
+        assert_eq!(reported.completed, 4);
+        assert_eq!(
+            reported.bytes_from(half.id),
+            root_len + children[0].len() as u64
+        );
+        assert_eq!(
+            reported.bytes_from(full.id),
+            (children[1].len() + children[2].len()) as u64
+        );
+        assert_eq!(reported.bytes, expected_bytes);
+        Ok(())
+    }
+
+    /// A provider whose blobs handler lets the first `allow` chunk groups
+    /// through and then holds every further one, with the connection alive.
+    async fn throttled_node(
+        data: &[u8],
+        allow: usize,
+    ) -> TestResult<(iroh::protocol::Router, Hash, tokio::task::JoinHandle<()>)> {
+        use crate::provider::events::{EventMask, EventSender, ProviderMessage, ThrottleMode};
+        let store = MemStore::new();
+        let tt = store.add_slice(data).await?;
+        let (events, mut messages) = EventSender::channel(
+            8,
+            EventMask {
+                throttle: ThrottleMode::Intercept,
+                ..EventMask::DEFAULT
+            },
+        );
+        let gate = tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut allowed = 0;
+            while let Some(message) = messages.recv().await {
+                if let ProviderMessage::Throttle(message) = message {
+                    if allowed < allow {
+                        allowed += 1;
+                        message.tx.send(Ok(())).await.ok();
+                    } else {
+                        held.push(message);
+                    }
+                }
+            }
+        });
+        let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await?;
+        let router = iroh::protocol::Router::builder(ep)
+            .accept(crate::ALPN, BlobsProtocol::new(&store, Some(events)))
+            .spawn();
+        Ok((router, tt.hash, gate))
+    }
+
+    /// A download dropped while its attempt is mid-transfer never reports the
+    /// attempt's `BytesTransferred`; the live counters handed out with
+    /// `TryProvider` still hold what it received.
+    #[tokio::test]
+    async fn downloader_attempt_stats_survive_a_cancelled_download() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r3, store3, _, sp3) = node_test_setup_fs(testdir.path().join("consumer")).await?;
+        let data = vec![42u8; 1024 * 1024];
+        let (stall, hash, gate) = throttled_node(&data, 4).await?;
+        sp3.add_endpoint_info(stall.endpoint().addr());
+        let swarm = Downloader::new(&store3, r3.endpoint());
+
+        let mut stream = swarm
+            .download(hash, vec![stall.endpoint().id()])
+            .stream()
+            .await?;
+        let stats = loop {
+            match tokio::time::timeout(BOUND, stream.next()).await? {
+                Some(DownloadProgressItem::TryProvider { stats, .. }) => break stats,
+                Some(_) => {}
+                None => panic!("the download ended"),
+            }
+        };
+        tokio::time::timeout(BOUND, async {
+            let mut last = 0;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let now = stats.payload_bytes();
+                if now > 0 && now == last {
+                    return;
+                }
+                last = now;
+            }
+        })
+        .await?;
+        let mut ended = false;
+        while let Ok(item) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await
+        {
+            match item {
+                Some(DownloadProgressItem::BytesTransferred { .. }) | None => ended = true,
+                Some(_) => {}
+            }
+            if ended {
+                break;
+            }
+        }
+        assert!(!ended, "the attempt ended instead of stalling");
+        drop(stream);
+
+        let payload = stats.payload_bytes();
+        assert!(payload > 0 && payload < data.len() as u64, "{payload}");
+        assert_eq!(stats.wire_bytes(), None);
+        // What was decoded, of which the store may not have everything yet.
+        let local = store3
+            .remote()
+            .local(HashAndFormat::raw(hash))
+            .await?
+            .local_bytes();
+        assert!(local <= payload, "live count {payload}, stored {local}");
+        gate.abort();
+        Ok(())
+    }
+
+    /// The first provider dies after delivering part of the blob; the next one
+    /// delivers the rest. Both are credited with their own bytes, which add up
+    /// to the blob.
+    #[tokio::test]
+    async fn downloader_credits_a_provider_that_dies_mid_transfer() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("holder")).await?;
+        let (r3, store3, _, sp3) = node_test_setup_fs(testdir.path().join("consumer")).await?;
+        let data = (0..1024 * 1024)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        store1.add_slice(data.clone()).await?;
+        let (dying, hash, gate) = throttled_node(&data, 4).await?;
+        let holder = r1.endpoint().addr();
+        sp3.add_endpoint_info(holder.clone());
+        sp3.add_endpoint_info(dying.endpoint().addr());
+        let dying_id = dying.endpoint().id();
+        let swarm = Downloader::new(&store3, r3.endpoint());
+
+        let mut stream = swarm
+            .download(hash, vec![dying_id, holder.id])
+            .stream()
+            .await?;
+        let killer = {
+            let dying = dying.clone();
+            let store3 = store3.clone();
+            tokio::spawn(async move {
+                loop {
+                    let held = store3
+                        .remote()
+                        .local(HashAndFormat::raw(hash))
+                        .await
+                        .map(|l| l.local_bytes())
+                        .unwrap_or(0);
+                    if held > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                dying.shutdown().await.ok();
+            })
+        };
+        let reported = tokio::time::timeout(BOUND, collect(&mut stream)).await?;
+        killer.await?;
+        gate.abort();
+
+        assert_eq!(reported.errors, 0);
+        assert_eq!(reported.misattributed, 0);
+        assert_eq!(reported.tried, vec![dying_id, holder.id]);
+        assert_eq!(reported.failed, vec![dying_id]);
+        let (from_dying, from_holder) = (
+            reported.bytes_from(dying_id),
+            reported.bytes_from(holder.id),
+        );
+        assert!(from_dying > 0 && from_holder > 0, "{reported:?}");
+        assert_eq!(from_dying + from_holder, data.len() as u64);
+        assert_eq!(reported.bytes, data.len() as u64);
+        assert_eq!(store3.get_bytes(hash).await?.deref(), data.as_slice());
         Ok(())
     }
 
