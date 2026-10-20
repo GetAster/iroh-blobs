@@ -1,0 +1,190 @@
+# Aster patch ledger: iroh-blobs
+
+This repository is Aster's fork of [n0-computer/iroh-blobs](https://github.com/n0-computer/iroh-blobs). Aster carries the patches listed below on top of upstream releases. Upstream maintainers are welcome to incorporate any of them, in whole or in part, at their discretion.
+
+## Branch and tag model
+
+- `main` is the front door: upstream's README with an Aster preamble, plus this ledger. Nothing is built from `main`.
+- `upgrade/<version>` is the patched integration line for one upstream release wave: the upstream release plus the patches in this ledger. Consumers pin it by commit.
+- Topic branches carry one change each and are named for what the change is, for example `feat/read-into` or `security/plumtree-bounds`. Each is based on the upstream release tag and is cherry-picked with `git cherry-pick -x` onto the upgrade branch, so every upgrade-branch commit names its source.
+- Release tags mark the commits that are released and pinned. Published tags are never moved or rewritten. Historical tags in this repository use several schemes (listed below); new tags use `aster-<repo>-v<version>`, where `<version>` is the published version of the repository's main package (for example `aster-salvo-v1.0.4`, `aster-fory-v1.7.6-aster.1`).
+- `main` is refreshed by merging upstream `main` into it. It is not force-pushed.
+
+Tag schemes used in this repository:
+
+- `aster-iroh-blobs-v<version>`, for example `aster-iroh-blobs-v0.101.0`, `aster-iroh-blobs-v0.102.0`, `aster-iroh-blobs-v0.103.10`.
+- `aster-iroh-blobs-v<version>-p<n>`, a later commit at the same crate version, for example `aster-iroh-blobs-v0.103.0-p1`…`-p3`, `aster-iroh-blobs-v0.103.1-p1`, `aster-iroh-blobs-v0.103.5-p1` and `-p2` (the recorded ones are patch-block re-pins with no source change).
+
+## Current release
+
+| Field | Value |
+|---|---|
+| Upstream base | `v0.103.0` |
+| Integration branch | `upgrade/iroh-blobs-v0.103` |
+| Tag | `aster-iroh-blobs-v0.103.10` |
+| Pinned commit | `bcd00bb2a888f3d6990ac32d9fab1d8e2d9d73f4` |
+| Crate version | 0.103.10 (workspace spec `iroh-blobs = "0.103.10"`) |
+| Source repository | `https://forge.emrul.dev/Aster/iroh-blobs.git` |
+
+The fork's own `[patch.crates-io]` (row 5) pins the stack Aster links it against: iroh `a4a9a76b` (1.3.2), noq `e75f3a55` (1.3.2) and iroh-util `6c42d23` (0.6.3); the re-pin is part of the row 34 upgrade-branch commit.
+
+Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
+
+```toml
+iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "bcd00bb2a888f3d6990ac32d9fab1d8e2d9d73f4" }
+```
+
+## Patches
+
+Row numbers are stable patch ids shared across Aster's iroh-family forks (iroh, iroh-blobs, iroh-docs, iroh-gossip, iroh-util, noq), so a commit message that says "row 26" resolves here. This repository's dependency patch block shares number 5 with an unrelated iroh row; it is listed here as 5.
+
+| Id | Topic branch | What | Why / what in Aster depends on it | Commits (topic / upgrade) | Status | Conflict or porting notes |
+|---|---|---|---|---|---|---|
+| 5 | none recorded (original commit `14a2286e`) | `[patch.crates-io]` entries for the Aster `iroh`, `iroh-base`, `iroh-relay` and `noq` forks (and, since row 34, `iroh-util`), so the crate resolves the same fork stack when built standalone. File: `Cargo.toml`. | Prevents dependency-graph splits when building or testing iroh-blobs outside the Aster repository, which is where fork patches get validated. Aster's own root patch overrides it. | `14a2286e` (original); rc.1 copy `94964e8e`; re-pinned in later waves (see History) | carried | Low conflict risk. Pin explicit fork revs or tags. Drop stale `ed25519-dalek 3.0.0-pre.6` comments. |
+| 6 | `fix/iroh-blobs-batch-small-reads` | Adds `Blobs::get_bytes_many_if_complete`, backed by a batched fs-store inline-data read command plus the existing validated export fallback for non-inline complete blobs. Files: `src/api/blobs.rs`, `src/api/proto.rs`, `src/store/fs.rs`, `src/store/fs/meta.rs`, `src/store/fs/meta/proto.rs`, `src/store/mem.rs`, `src/store/readonly_mem.rs`. | `aster_transport_core::CoreDoc::read_entry_contents_if_complete` exposes it to portal-cas; `Manifest::read_snapshot` reads all object/link value blobs with two batch calls instead of one status plus one read per entry. | `a0cbdd15` (rc.1, on `upgrade/iroh-blobs-v0.102`); carried forward since | carried | Medium conflict risk around the blob store request enum and the fs/meta actor command enums. Preserve response ordering, missing/partial as `None`, inline hash verification, and fallback through `get_bytes` for non-inline complete blobs. Test: `cargo test -p iroh-blobs test_get_bytes_many_if_complete`. |
+| 7 | `fix/iroh-blobs-batch-status` | Adds `Blobs::status_many`, with batched store-actor status handling for the fs, mem and readonly-mem stores. Same files as row 6. | The iroh-docs `LiveActor` uses it to batch local completeness checks while scheduling many content downloads from a RemoteInsert burst (iroh-docs row 15). | `e20ff029` (rc.1) | carried | Medium conflict risk, same enums as row 6. Preserve response ordering and exact single-`status` semantics for complete, partial and missing blobs. Test: `cargo test -p iroh-blobs test_status_many`. |
+| 8 | `feat/multifetch` (based on `v0.103.0`) | Makes download progress observable. Root fetch in `Split` mode reports through the real sink instead of `Drain`, minus its legacy `Progress` offsets (`RootProgressFilter`), because split mode runs two independent counters and forwarding both made the offset go backwards (e.g. `[384, 1, 2, …]`). The split fan-in is drained after the futures stream ends (previously a fast final child lost its `PartComplete`). `TryProvider` moves after the `local.is_complete()` early return, so an already-resident request is not reported as an attempt. New additive `DownloadProgressItem::BytesTransferred(u64)` gives a per-attempt total of successfully decoded payload bytes (`Progress` is a cumulative offset that includes local bytes and is re-based per child, so it cannot be summed). Provider ordering, failover, resumption and split scheduling are unchanged. Files: `src/api/downloader.rs`, `src/util.rs`. | `aster_transport_core::CoreBlobsClient::run_download` folds the stream into `CoreFetchReport`, which `aster::Blobs::download_hash_from` / `download_hash_to_store_from` / `download_collection_from` expose to portal-sync for topology-aware provider ranking. | `adab99f1`..`02d6a2e3` / `a2e15663`..`7e0da6f7` (released as 0.103.1; earlier multifetch work as 0.103.0) | carried | Medium conflict risk in `execute_get` and `handle_download_split_impl`. Preserve `Progress` monotonicity in split mode; `BytesTransferred` comes from the returned `Stats::payload_bytes_read` on success and from the last raw sink value on failure. The statement order of `pool.get_or_connect` and the local scan is inert (`get_or_connect` is an `async fn`, so nothing happens until awaited); it is left as upstream has it and no overlap is claimed. Six tests in `api::downloader::tests` pin each behaviour. `BytesTransferred` is a transfer metric (the sum of what each attempt decoded), not a content size. Its shape changed in row 35. |
+| 23 | `fix/gc-sweep-custody` (tip `64b1631c3e`, a single stack on `v0.103.0`; backfilled) | Four stacked GC fixes: (1) a tag created after the sweep's mark joins the in-flight sweep's delete-time protection (the DeleteBlobs dispatch filters live temp tags in the actor, linearizing tag creation against the sweep); (2) HashSeq custody protects the children too, via `AddProtected`; (3) an unenumerable HashSeq claim poisons the in-flight sweep (`Protection::sweep_poisoned`) instead of letting it delete members nobody can enumerate; (4) every collection root is traversed, novel hash or not. Files: `src/store/gc.rs`, `src/store/fs.rs`, `src/store/fs/meta.rs` (+`/proto`), `src/api/{blobs,proto,tags}.rs`, `src/util/temp_tag.rs`, `src/store/{mem,readonly_mem}.rs`. | portal-sync's retention tags and `gc_run_once` cadence exercise exactly these windows; the K-matrix dedupe-untag and blob-retention scenarios are the downstream regressions. | `64b1631c3e` / `188c4555`..`bf21d4fe`; released as 0.103.2–0.103.5 | carried | Medium conflict risk against rows 6 and 7 (shared import lists and command enums in `fs/meta`). The four commits are textually interdependent in `store/gc.rs` and `fs/meta.rs`: port as a unit, in order. The topic branch was reconstructed after release, so its `(cherry picked from …)` trailers point at the upgrade-branch commits (inverted provenance; see History). 12 GC tests (`store::gc::tests`, mem and fs) pin all four behaviours. `cargo fmt --check` reports existing drift in this GC code. |
+| 26 | `fix/provider-stall-failover` (tip `47cab4d6`, stacked on `feat/multifetch`) | Adds `DownloadRequest::provider_idle_timeout` (`with_provider_idle_timeout`). `execute_get` only failed over when an attempt errored; a provider that accepts a request and then stops sending never errors, because iroh's default QUIC keep-alive keeps the connection alive, so one stalled provider blocked every provider after it. With the timeout set, each attempt runs under a stall guard whose clock restarts on every payload `Progress` and covers the whole attempt (stream open, first chunk, last chunk). A stalled attempt reports `BytesTransferred` + `ProviderFailed` exactly like a failed one, and the next provider is asked only for `local.missing()`. Default `None` keeps upstream behaviour. File: `src/api/downloader.rs`. | `aster_transport_core` ordered fetch (`download_hash_from` and friends) sets it, so a stalled provider no longer pins portal-sync's fetch until its whole-call timeout, which also made Portal blame the wrong provider (portal-sync fetch-locality request R4). | `47cab4d6` / `2938c882`; released as 0.103.6 at `8fa6fea6` | carried | Low–medium conflict risk in `execute_get` (shares the attempt-byte counter with row 8, hence stacked). Threaded through the plain path, `split_request`'s root fetch and every split child. Adding a pub field breaks struct-literal construction; every in-tree and Aster caller uses `DownloadRequest::new`. Three tests: the default blocks on a stalled lead, and plain and split modes fail over with a 500 ms idle timeout; disabling the guard fails both fail-over tests. The stall clock is touched before the progress send, so a consumer that stops draining progress for longer than the timeout can also trip it. |
+| 27 | `fix/fs-store-tokio-features` (tip `8c0117e0`, on `v0.103.0`) | The `fs-store` feature now enables `tokio/rt-multi-thread`. The fs store builds a multi-threaded runtime (`FsStore::load_with_opts`) and drops it under `block_in_place` (`RtWrapper`), but the crate asked tokio only for `sync` and relied on another dependency to enable the rest. With the 1.3.0-wave pins nothing in the lib graph does, so `cargo check --lib` and `cargo publish`'s package verification fail (E0425/E0599). File: `Cargo.toml`. | The Aster native publish wave verifies each fork crate standalone; 0.103.6 failed there (Aster 0.3.1014 promote job, 2026-10-14). Aster's own workspace enables the feature, so its CI did not see it. | `8c0117e0` / `b28c5260`; released as 0.103.7 at `f04ca2cd` | carried | Trivial conflict risk (one feature list). Upstream has the same latent gap at `v0.103.0`; drop the row if upstream declares the feature. `cargo check --lib` reproduces it without the patch. |
+| 28 | `feat/zstd-transport` (tip `7330ac18`, stacked on `fix/provider-stall-failover`) | First ports upstream's unreleased `Downloader::builder` (`6bd5f2b0`, cherry-pick of upstream `1ff1585a`, #283: `.alpn(..)`, `.pool_options(..)`; `new_with_opts` deprecated), then adds stream transforms. `transport::StreamTransform` wraps both halves of every stream. `TransformedBlobsProtocol` serves the unmodified provider on a derived ALPN with the same `EventSender` (`provider::handle_connection_with_transform`); its `shutdown` leaves the store to the plain handler. `DownloaderBuilder::stream_transform` wraps every downloader attempt, so the ordered walk, local-aware resume, stall guard and progress attribution are unchanged. `DownloaderBuilder::plain_fallback(ttl)` retries a provider on `crate::ALPN` when its handshake fails with TLS alert 120 (`no_application_protocol`), emits the new `DownloadProgressItem::PlainFallback { id, cached }`, and remembers the refusal for `ttl`. Feature `zstd` (off by default; `zstd` 0.14 with `default-features = false`, so zstd-sys) adds `ZstdTransform` on `ZSTD_ALPN` = `/iroh-bytes/4+zstd/1`: level 3 by default, clamped to 1..=19, frame checksums, receiver window capped at 2^23. Every `SendStream::sync` ends a frame. A stream that ends inside a frame, or is not zstd, fails with `InvalidData` and is counted in `ZstdStats::decode_errors`. Observe updates now `sync` after each item (a no-op on plain streams). Files: `src/api/downloader.rs`, `src/transport.rs`, `src/transport/zstd.rs`, `src/provider.rs`, `src/lib.rs`, `Cargo.toml`. | portal-sync request `2026-08-22-iroh-blobs-transport-compression`: compress Portal's text-heavy content fetches without giving up Aster's ordered multi-provider fetch. Measured on the crate's own sources: 4.53x (77.9% saved) at level 3. | `6bd5f2b0` + `7330ac18` / `e9b8e986` + `175f98a7`; released as 0.103.8 at `4971183c` | carried | The default `Downloader` is byte-for-byte upstream on the wire (same ALPN, same streams, same attempt path). Adding a `DownloadProgressItem` variant breaks exhaustive matches; Aster's `FetchAccumulator` is the known one. Collapse the #283 part when an upstream release contains it. The transform API and the zstd framing (one frame per `sync`) are Aster's own; renaming `ZSTD_ALPN` is a wire break. Tests: 6 codec tests and 8 downloader tests in `transport::zstd::tests` (round trip, partial resume, ordered fail-over attribution, fresh and cached fallback, no fallback, local short-circuit, stall fail-over, garbage and truncated providers that fail over without completing the blob), plus an ignored throughput measurement. Ignoring the transform, removing the fallback, not ending frames on `sync`, or reading a mid-frame end as clean each fail them. |
+| 34 | `fix/downloader-lost-connection` (tip `826c6bd2`, stacked on `feat/zstd-transport`) | With `provider_idle_timeout` set, the stall guard also records `conn.stats().udp_rx.datagrams` before the request; if it has not moved after `silence_bound` (4 × the slowest path RTT, at least 1 s, at most the idle timeout) the attempt is `Abandoned::Silent`. A silent attempt, or one whose connection closed by `Reset`/`TimedOut`/`LocallyClosed`, is lost: the downloader retires the connection (`ConnectionPool::retire`, primary or plain-fallback pool) and retries the same provider once on a fresh connection before moving on; each try emits `TryProvider`, the failed one `ProviderFailed`. Requires iroh-util 0.6.3 (iroh-util row 33). The upgrade-branch commit also re-pins the fork's patch block to iroh `a4a9a76b` / noq `e75f3a55` (1.3.2) and iroh-util `6c42d23`. No idle timeout, no change. Files: `src/api/downloader.rs`, `Cargo.toml`, `Cargo.lock`. | Root cause 3 of the Aster restart/reconnect investigation (Aster repository, `docs/_internal/investigations/2026-10-15-restart-reconnect.md`): after a restart on a new port nothing resets the old connection, so the pool handed it out until QUIC's 30 s idle timeout. Loopback probe, new port: blob recovery 31.1–32.0 s → 1.1–1.6 s from kill. A same-port reset is now also retried within the same fetch. | `d38d5053` + `826c6bd2` / `21dce20e` + `e1cb0b07`; released as 0.103.9 at `094bdd2f` | carried | **Aster's own; no upstream equivalent (checked 2026-10-15): n0-computer/iroh-blobs #141, #185, #213, #224, #226, #227, #229, #283 and n0-computer/iroh-util #1–#19.** Medium conflict risk in `execute_get` (loop restructured for the retry; rows 26 and 28 touch the same function); `Dialed` gains a `pool` field. Heuristic risk: a healthy connection on which nothing at all arrives for the bound (every stream blocked, keep-alive not yet due) is retired and redialed once. Tests: `downloader_recovers_from_a_provider_restarted_on_a_new_port` (provider killed by runtime shutdown, back on a new port with the same key; fetch 1.01–1.02 s, tried [p, p], failed [p]); the 0.103.8 downloader stalls 10.0 s and fails; without retire + retry it fails at 1 s. The existing stall fail-over tests (plain, split, zstd) still treat the live stalling provider as stalled. lib 129 (3 ignored) + integration 23; clippy `--all-features --all-targets -D warnings` clean; `downloader.rs` fmt clean (existing fmt drift in GC files untouched). |
+| 35 | `feat/attempt-transfer-stats` (tip `016fb4b3`, stacked on `fix/downloader-lost-connection`) | `DownloadProgressItem::BytesTransferred(u64)` becomes `BytesTransferred { id, request, bytes, wire_bytes }`: the attempt's provider and request, its payload, and `wire_bytes`, what its streams received before the stream transform decoded them (`None` over plain streams); emitted when either figure is non-zero. `TryProvider` gains `stats: AttemptStats` (`#[serde(skip)]`), the attempt's live counters (`payload_bytes()`, `wire_bytes()`, `transform_tally()`), updated as the attempt runs, so a consumer that stopped reading the stream (a cancelled download) still sees what an unfinished attempt received. `StreamTransform` gains `send_stream_tallied` / `recv_stream_tallied` (defaults ignore the tally), `TransformedConnection::with_tally`, and `transport::StreamTally`; the downloader passes each transformed attempt its own tally. `ZstdSendStream` / `ZstdRecvStream::with_tally` count into it as well as the shared `ZstdStats`, so node-wide counters are unchanged. Files: `src/api/downloader.rs`, `src/transport.rs`, `src/transport/zstd.rs`. | portal-sync request `2026-10-16-aster-transfer-metrics` M3 and per-peer fetched wire bytes (M1): `aster_transport_core`'s `FetchAccumulator` credits payload and zstd wire bytes per provider (`ProviderOutcome::bytes_transferred()` / `wire_bytes()`), exact under split and failover and in a tracker report taken after cancellation; `BlobMeter` credits per-peer `fetched_wire_bytes` / `fetched_plain_bytes`. Before, `BytesTransferred` went to whichever provider was announced last, and the fetch side's one shared zstd transform could not split wire bytes by provider. | `016fb4b3` / `35eb0f03`; released as 0.103.10 at `bcd00bb2` | carried | **Aster's own; no upstream equivalent (checked 2026-10-16): upstream `main` (`1ff1585a`) has no `BytesTransferred` (row 8) and no stream transforms (row 28); issues/PRs searched for per-provider or per-attempt download bytes and transform counters: #4 (multi-provider fan-in, open), #147 (stream type abstraction), #225, #232, #250, #270, #271–#290; none adds attempt counters.** Breaking API in a patch release: `BytesTransferred` is a struct variant and `TryProvider` has a third field, so exhaustive matches and struct-literal patterns break; Aster's `FetchAccumulator` and `BlobMeter` are the known consumers. `AttemptStats` reads zero across an rpc boundary. Medium conflict risk in `execute_get` (rows 8, 26, 28, 34) and the zstd stream structs; low in `transport.rs` (default trait methods). Tests: `downloader_split_credits_bytes_per_provider` (three children; root and child 0 from a half holder, children 1–2 from the full one; exact bytes per provider; every `BytesTransferred` names its own attempt), `downloader_credits_a_provider_that_dies_mid_transfer` (throttled provider shut down after part of the blob is stored; both credited, summing to the blob), `downloader_attempt_stats_survive_a_cancelled_download` (download dropped mid-attempt; live payload > 0, ≥ stored, no `BytesTransferred`, no wire bytes), `zstd_wire_bytes_are_attributed_per_provider` (dying zstd provider then holder: wire < payload for each, wire sum = node-wide `ZstdStats::wire_bytes_read`; a plain fallback reports `None`), `zstd_attempt_stats_survive_a_cancelled_download` (live wire < live payload, = node-wide). `downloader_counts_bytes_from_a_partial_provider` also checks per-provider credit and live counters. Ablations: not tallying zstd streams fails both zstd tests; not updating the live counter fails the cancellation tests and the dies-mid-transfer test. lib 134 (3 ignored) + integration 6 with `--all-features`; clippy `--all-targets -D warnings` with and without `--all-features`; touched files fmt clean. |
+
+Bookkeeping and documentation commits (not needed at runtime):
+
+| Commits | Files | Purpose | Status |
+|---|---|---|---|
+| `39ad2947` (rc.1) | `.gitignore` | Ignores local `docs/aster/` internal notes. | Recorded in the rc.1 stack; current status not recorded. Optional. |
+| `c23a66ac` (rc.1) | `Cargo.lock` | Resolves the Aster iroh/noq fork crates. Regenerated each wave. | carried in spirit (regenerated, not cherry-picked). |
+| `ede454c7` | `README.md` | Aster fork overview and contribution table. | Replaced by the `main` README preamble under the current model; if reused, refresh PR statuses. |
+
+### Upstreamed or dropped
+
+No iroh-blobs patch has been upstreamed or dropped. Row 28 carries a port of upstream's unreleased `Downloader::builder` (#283, `1ff1585a`); that part collapses when an upstream release contains it.
+
+### Branches not yet triaged
+
+These topic branches exist in this repository (April 2026, from an earlier security review) but are not on the current upgrade branch and have no row above. Whether each is still needed, was fixed upstream, or should be dropped has not been decided yet.
+
+| Branch |
+|---|
+| `security/error-handling-cleanup` |
+| `security/file-import-safety` |
+| `security/protocol-input-validation` |
+| `security/store-robustness` |
+
+## Porting to a new upstream release
+
+Order across the iroh family: noq first, then iroh, then this repository, then iroh-docs and iroh-gossip (iroh-docs depends on iroh-blobs). iroh-util must be ported before row 34 is applied. Because each satellite's `[patch.crates-io]` names other forks by revision, re-pin in dependency order noq → iroh → iroh-blobs → iroh-docs / iroh-gossip, and publish iroh-blobs before iroh-docs.
+
+Before touching branches, read the upstream changelog and the commit range from `v0.103.0` to the target (e.g. `git log --oneline v0.101.0..v0.102.0` and `git diff --stat` in the rc.1 port), and decide for each row: keep, drop because upstream absorbed it, or rewrite. Check #283 (row 28) and whether upstream declares `tokio/rt-multi-thread` for `fs-store` (row 27).
+
+Reapply order on the new base:
+
+1. Row 5 (patch block, re-pointed at the new noq/iroh/iroh-util fork revs), then regenerate `Cargo.lock`.
+2. Rows 6 and 7 (batch API).
+3. Row 23 (GC sweep custody), as a unit, in order.
+4. Row 27.
+5. The stacked downloader line, in order: row 8 (`feat/multifetch`) → row 26 (`fix/provider-stall-failover`) → row 28 (`feat/zstd-transport`) → row 34 (`fix/downloader-lost-connection`) → row 35 (`feat/attempt-transfer-stats`).
+
+```bash
+git fetch --all --tags --prune
+git push origin <new-upstream-tag>      # mirror the upstream tag to the forge
+git switch -c upgrade/iroh-blobs-<new-version> <new-upstream-tag>
+# cherry-pick -x each row's commits in the order above
+git tag -a aster-iroh-blobs-v<published version> -m "Aster iroh-blobs v<published version>"
+git push origin upgrade/iroh-blobs-<new-version> aster-iroh-blobs-v<published version>
+```
+
+Prefer `cherry-pick -x`; if a patch no longer applies, treat the "What" and "Conflict or porting notes" columns as the specification. Do not rewrite a published `upgrade/*` branch or tag unless you are deliberately replacing a failed attempt.
+
+Validate in this repository:
+
+```bash
+cargo fmt --check
+cargo test --all-features
+cargo clippy --all-features --all-targets -- -D warnings
+cargo check --lib          # catches the row 27 class of standalone feature gaps
+```
+
+Then re-pin the iroh-docs fork's own `[patch.crates-io]` to the new iroh-blobs commit and run its full suite (`cargo test --all-features`, 118 tests including `tests/sync.rs`): iroh-docs exercises the whole stack, and must be run whenever iroh-blobs moves.
+
+Gotcha when re-pinning this fork's own patch block: `cargo update -p iroh` alone kept crates.io iroh (1.0.2) and reported the patches as unused. Temporarily requiring `iroh = "1.3.0"` and running `cargo update -p <crate>` moved the transitive dependencies; restoring the original spec keeps that lock.
+
+Registry provenance: the Aster publisher's `publish-native-stack.py check` clones the fork at the pinned rev and validates that, so it cannot detect divergence between the pin and what the registry actually serves. To check what the registry serves, extract the published `.crate` and diff it against the source. Registry versions are immutable; never yank or overwrite a published version.
+
+Aster validation after updating pins, from the Aster repository root:
+
+```bash
+cargo fmt --check
+cargo clippy --manifest-path bindings/python/rust/Cargo.toml -- -D warnings
+cargo test -p aster_transport_core
+cargo test -p aster --all-features
+uv run maturin develop -m bindings/python/rust/Cargo.toml
+uv run pytest tests/python/ -v --timeout=30
+```
+
+Update the fork manifest (canonical `docs/aster-fork-manifest.toml` in the Aster iroh fork; synced copy `iroh-fork-manifest.toml` in the Aster repository) and this ledger's Current release section.
+
+Local checkouts: downstream workspaces with `[patch.crates-io]` path overrides into a local checkout (for example portal-sync) build whatever is checked out. After publishing, switch the local checkout to the released tag (for development, the upgrade branch, which can sit past the tag), and run at least one path-override consumer check (for example `cargo check --locked -p portal-cas` in portal-sync).
+
+Before the current branch model, fork `main` mirrored upstream `main` and was reset to it on each port (`git reset --hard upstream/main`, `git push origin main --force-with-lease`). Under the current model `main` is the front door and is not reset.
+
+## History
+
+### 1.3.0 wave (2026-10-03 onward), current
+
+The iroh 1.3.0 wave had no upstream iroh-blobs release that forced a re-port; base stays `v0.103.0`. Releases in this wave, newest first:
+
+| Version | Commit | Tag | Change |
+|---|---|---|---|
+| 0.103.10 | `bcd00bb2` | `aster-iroh-blobs-v0.103.10` | Row 35 (per-attempt transfer stats). Current pin. |
+| 0.103.9 | `094bdd2f` | `aster-iroh-blobs-v0.103.9` | Row 34 (retire a silent or lost connection and retry once), plus the re-pin to iroh/noq 1.3.2 and iroh-util 0.6.3. |
+| 0.103.8 | `4971183c` | `aster-iroh-blobs-v0.103.8` | Row 28 (zstd stream transport, with the port of upstream #283), 2026-10-15. Committed and tagged locally first; the Aster repository kept 0.103.7 until the branch, tag and registry crate were published. |
+| 0.103.7 | `f04ca2cd` | `aster-iroh-blobs-v0.103.7` | Row 27 (fs-store tokio features), 2026-10-14. |
+| 0.103.6 | `8fa6fea6` | `aster-iroh-blobs-v0.103.6` | Row 26 (provider stall fail-over), 2026-10-14. Never reached the registry: its package verification failed in the Aster 0.3.1014 promote job (row 27 fixes that). |
+| 0.103.5-p1 | `712ce693` | `aster-iroh-blobs-v0.103.5-p1` | Intermediate re-pin on noq 1.3.0, superseded the same day. Do not pin it. |
+
+- Same-day follow-up after noq 1.3.1: the fork's own patch block was re-pinned to iroh `1974e958` and noq `867a3a9a`. Lock and pin changes only; the crate version was unchanged and the publisher skipped it as identical. Validation: iroh-blobs 133 tests, clippy clean; `cargo fmt --check` reported existing drift in the GC patch code (row 23), which these commits do not touch.
+- At that point the iroh-docs fork's own patch block still named iroh-blobs `b535aa30`; harmless (the Aster repository's root patch overrides it and the registry dependency is `0.103`). iroh-docs 0.101.5-p2 (2026-10-16) re-pinned it to `bcd00bb2`.
+
+### 1.0.1 wave (2026-07-02)
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.103.0` | `aster-iroh-blobs-v0.103.5-p2` | `b535aa30ae61f82a1b048015817bf4365862ce62` | `upgrade/iroh-blobs-v0.103` |
+
+- No upstream release; pins unchanged from the 1.0 wave until the additions below.
+- **2026-08-13, 0.103.1** (tag `aster-iroh-blobs-v0.103.1`): three post-tag commits (row 8): downloader progress observability, its monotonicity follow-up, and a test/contract tightening. Canonical source branch `feat/multifetch`, based on `v0.103.0`. The registry's immutable `iroh-blobs 0.103.0` had been published mid-development and is byte-identical to `1f01a087` (verified by diffing the extracted `.crate` against each rev), so consumers already had the multifetch progress work. The bump to 0.103.1 is hygiene (the delta from that archive is a doc comment plus a test assertion, no behavioural code) and restores one version = one source state. Do not yank 0.103.0.
+- **2026-08-13 sweep (`-p1` tags):** the fork's own `[patch.crates-io]`, which had named the GitHub mirror at the 1.0.0-wave iroh (`3c329f0c`) and noq (`ddb8829d`), was moved to Forgejo at this wave's revisions, in dependency order noq → iroh → iroh-blobs → iroh-docs / iroh-gossip. No `src` change, no version change, nothing republished.
+- **2026-08-24..26, 0.103.2–0.103.5 (row 23), remediated 2026-08-27:** during the portal-sync cutover campaign the GC sweep-custody stack was committed directly on `upgrade/iroh-blobs-v0.103`, with no topic branch and no `-x` trailers. `fix/gc-sweep-custody` (`64b1631c3e`, all four fixes stacked on `v0.103.0`) was reconstructed afterwards; it compiled and passed its regression tests before push. Its trailers point at the upgrade-branch release commits, the opposite of the normal flow, because the releases existed first. Released tags and registry artifacts were not touched. The upgrade branch then sat past the 0.103.5 tag with post-release GC docs commits.
+- Validation: per-fork fmt/clippy (`-D warnings`, `--all-features --tests`)/tests, then downstream `aster_transport_core` (242) and `aster --all-features` (94), PyO3 clippy clean, `maturin develop` and 1117 Python tests.
+- Local checkout at the end of the cycle: `aster-iroh-blobs-v0.103.5` (released code); the upgrade branch for development.
+
+### 1.0 wave (2026-06-21)
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.103.0` | `aster-iroh-blobs-v0.103.0` | `60d098c99d6a759b5b1bf0df635b149b50c74775` | `upgrade/iroh-blobs-v0.103` |
+
+- Patch stack carried forward unchanged from rc.1; everything cherry-picked clean except a `Cargo.lock` regeneration. Tag == pinned commit == validated code.
+- Validation: per-fork fmt/clippy/tests, then `aster_transport_core` (229) and `aster` (68) Rust tests and `maturin develop` + 1117 Python tests.
+
+### rc.1 port (2026-06-07)
+
+- Before the port Aster pinned `e20ff0292d` (`fix/iroh-blobs-batch-status`); upstream base `v0.102.0` (`099e7cfd`), target the same; stack range `v0.102.0..fix/iroh-blobs-batch-status`. Earlier upgrade branch name: `upgrade/iroh-blobs-v0.101`.
+- Ported and published through `e20ff029`: fork `main` mirrored upstream `main` (`099e7cfd`); branch `upgrade/iroh-blobs-v0.102` pushed to `aster-rpc/iroh-blobs`; tag `aster-iroh-blobs-v0.102.0` marks the base rc1 port. The batch read and batch status fixes were also published on `fix/iroh-blobs-batch-small-reads` and `fix/iroh-blobs-batch-status` so later ports can cherry-pick them directly.
+
+| Commit | Purpose |
+|---:|---|
+| `94964e8e` | Cherry-pick of `14a2286e`: Aster iroh/noq `[patch.crates-io]` entries, updated to explicit rc1 revs. |
+| `39ad2947` | Ignore local `docs/aster/` internal notes. |
+| `c23a66ac` | `Cargo.lock` resolves the Aster iroh/noq fork crates. |
+| `a0cbdd15` | `Blobs::get_bytes_many_if_complete` (row 6). |
+| `e20ff029` | `Blobs::status_many` (row 7). |
+
+- Validation: `cargo fmt --check`; `cargo test -p iroh-blobs test_get_bytes_many_if_complete -- --nocapture`; `cargo test -p iroh-blobs test_status_many -- --nocapture`; `cargo test --all-features`; `cargo clippy --all-features --tests -- -D warnings`. Downstream, through the Aster repository and portal-cas: `cargo test -p aster_transport_core`, `cargo test -p aster namespace`, `cargo test -p portal-cas`, `cargo test -p portal-sync-session`, `cargo clippy -p aster_transport_core -p aster -- -D warnings`, `cargo clippy -p portal-cas -p portal-sync-session -- -D warnings`.
+- Perf triage (2026-06-07) tested whether H2's remaining small-file wall clock came from per-blob fs-store fsync in iroh-blobs. A no-network `import_bao_bytes` probe disproved it for H2: 500 × 128-byte blobs imported in ~31 ms serial / ~11 ms concurrent, while 500 × 20 KB above-inline blobs took ~3.1 s serial / ~1.8 s concurrent. The H2 files (`fN\n`) are below the inline threshold, so no fs-store patch was added. The measured fix was downstream (Aster commit `e741e31`), reusing a node-level blob `Downloader` instead of constructing a downloader actor and connection pool per hash.
+- The rc.1 command sequence was `git cherry-pick -x 14a2286e` onto `upgrade/iroh-blobs-v0.102` from `v0.102.0` (after reviewing `v0.101.0..v0.102.0`), then tag `aster-iroh-blobs-v0.102.0`. The Aster root patch block then pointed at `https://github.com/aster-rpc/iroh-blobs`; it now points at the Forgejo repository.
+- Until replacement tags were cut, path-override consumers kept the local checkout on the `fix/iroh-blobs-batch-status` tip; the end-of-cycle checkout tag was `aster-iroh-blobs-v0.102.0`.
