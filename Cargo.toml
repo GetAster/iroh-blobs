@@ -99,3 +99,13 @@ required-features = ["fs-store"]
 [[example]]
 name = "random_store"
 required-features = ["fs-store"]
+
+# Pin to the Aster iroh-family forks (iroh, noq, iroh-util) on Forgejo.
+[patch.crates-io]
+iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "261ad623da7eb4dbdbdba2b7a20bcc178a1b7b7c" }
+iroh-base = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "261ad623da7eb4dbdbdba2b7a20bcc178a1b7b7c" }
+iroh-relay = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "261ad623da7eb4dbdbdba2b7a20bcc178a1b7b7c" }
+noq = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "535bd88409193ae577f445a3207351bb83525f4e" }
+noq-udp = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "535bd88409193ae577f445a3207351bb83525f4e" }
+noq-proto = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "535bd88409193ae577f445a3207351bb83525f4e" }
+iroh-util = { git = "https://forge.emrul.dev/Aster/iroh-util.git", rev = "a90ea88d46b3178a5f1a7d4c3e28a34a2ad80aa4" }
