@@ -15,7 +15,7 @@ This repository is Aster's fork of [n0-computer/iroh-blobs](https://github.com/n
 Historical and current tag schemes in this repository:
 
 - `aster-iroh-blobs-v<version>`, for example `aster-iroh-blobs-v0.101.0`, `aster-iroh-blobs-v0.102.0`, `aster-iroh-blobs-v0.103.10`, `aster-iroh-blobs-v0.103.11` (the first on upstream `v0.103.1`), `aster-iroh-blobs-v0.103.12`.
-- `aster-iroh-blobs-v<version>-p<n>`, a later commit at the same crate version, for example `aster-iroh-blobs-v0.103.0-p1`…`-p3`, `aster-iroh-blobs-v0.103.1-p1`, `aster-iroh-blobs-v0.103.5-p1` and `-p2` (the recorded ones are patch-block re-pins with no source change).
+- `aster-iroh-blobs-v<version>-p<n>`, a later commit at the same crate version, for example `aster-iroh-blobs-v0.103.0-p1`…`-p3`, `aster-iroh-blobs-v0.103.1-p1`, `aster-iroh-blobs-v0.103.5-p1` and `-p2`, `aster-iroh-blobs-v0.103.12-p1` (the recorded ones are patch-block re-pins with no source change).
 
 ## Current release
 
@@ -23,17 +23,17 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.103.1` |
 | Integration branch | `upgrade/iroh-blobs-v0.103.1` (cut from `v0.103.1`; `upgrade/iroh-blobs-v0.103` is the historical per-minor line on `v0.103.0`) |
-| Tag | `aster-iroh-blobs-v0.103.12` |
-| Pinned commit | `5e1f4a6fe47c8c8728c9344e841ea841a0c4982c` |
+| Tag | `aster-iroh-blobs-v0.103.12-p1` (re-pin to noq 1.4.2) |
+| Pinned commit | `63ec9fc4afc9f098c932ebc6443266509e64f420` |
 | Crate version | 0.103.12 (workspace spec `iroh-blobs = "0.103.12"`; the registry already served 0.103.11, so the row 26 stall-clock fix publishes 0.103.12) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-blobs.git` |
 
-The fork's own `[patch.crates-io]` (row 5, re-pinned by `6f6b4195`) pins iroh `41ec78b1` (1.4.0, the noq 1.4.1 re-pin), noq `13dcb5b7` (1.4.1) and iroh-util `8c7947b6` (0.6.3), all matching the manifest. Upstream `v0.103.1` requires iroh-util 0.6.0; `15d47bdb` raises the requirement to 0.6.3 for row 34.
+The fork's own `[patch.crates-io]` (row 5, re-pinned by `63ec9fc4`) pins iroh `91a92aa0` (1.4.0-p2, the noq 1.4.2 re-pin), noq `a3c70b7a` (1.4.2) and iroh-util `c9b91fce` (0.6.3-p4), all matching the manifest. Upstream `v0.103.1` requires iroh-util 0.6.0; `15d47bdb` raises the requirement to 0.6.3 for row 34.
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "5e1f4a6fe47c8c8728c9344e841ea841a0c4982c" }
+iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "63ec9fc4afc9f098c932ebc6443266509e64f420" }
 ```
 
 ## Patches
@@ -42,7 +42,7 @@ Row numbers are stable patch ids shared across Aster's iroh-family forks (iroh, 
 
 | Id | Topic branch | What | Why / what in Aster depends on it | Commits (topic / upgrade) | Status | Conflict or porting notes |
 |---|---|---|---|---|---|---|
-| 5 | none recorded (original commit `14a2286e`) | `[patch.crates-io]` entries for the Aster `iroh`, `iroh-base`, `iroh-relay` and `noq` forks (and, since row 34, `iroh-util`), so the crate resolves the same fork stack when built standalone. File: `Cargo.toml`. | Prevents dependency-graph splits when building or testing iroh-blobs outside the Aster repository, which is where fork patches get validated. Aster's own root patch overrides it. | `14a2286e` (original); rc.1 copy `94964e8e`; re-pinned in later waves (see History); on `upgrade/iroh-blobs-v0.103.1`: `f4fb924b` | carried | Low conflict risk. Pin explicit fork revs or tags. Drop stale `ed25519-dalek 3.0.0-pre.6` comments. |
+| 5 | none recorded (original commit `14a2286e`) | `[patch.crates-io]` entries for the Aster `iroh`, `iroh-base`, `iroh-relay` and `noq` forks (and, since row 34, `iroh-util`), so the crate resolves the same fork stack when built standalone. File: `Cargo.toml`. | Prevents dependency-graph splits when building or testing iroh-blobs outside the Aster repository, which is where fork patches get validated. Aster's own root patch overrides it. | `14a2286e` (original); rc.1 copy `94964e8e`; re-pinned in later waves (see History); on `upgrade/iroh-blobs-v0.103.1`: `f4fb924b`, `6f6b4195` (noq 1.4.1), `63ec9fc4` (noq 1.4.2) | carried | Low conflict risk. Pin explicit fork revs or tags. Drop stale `ed25519-dalek 3.0.0-pre.6` comments. |
 | 6 | `fix/iroh-blobs-batch-small-reads` | Adds `Blobs::get_bytes_many_if_complete`, backed by a batched fs-store inline-data read command plus the existing validated export fallback for non-inline complete blobs. Files: `src/api/blobs.rs`, `src/api/proto.rs`, `src/store/fs.rs`, `src/store/fs/meta.rs`, `src/store/fs/meta/proto.rs`, `src/store/mem.rs`, `src/store/readonly_mem.rs`. | `aster_transport_core::CoreDoc::read_entry_contents_if_complete` exposes it to portal-cas; `Manifest::read_snapshot` reads all object/link value blobs with two batch calls instead of one status plus one read per entry. | `a0cbdd15` (rc.1, on `upgrade/iroh-blobs-v0.102`); carried forward since (`cb90ffe4` on `upgrade/iroh-blobs-v0.103`, `6174d23d` on `upgrade/iroh-blobs-v0.103.1`) | carried | Medium conflict risk around the blob store request enum and the fs/meta actor command enums. Preserve response ordering, missing/partial as `None`, inline hash verification, and fallback through `get_bytes` for non-inline complete blobs. Test: `cargo test -p iroh-blobs test_get_bytes_many_if_complete`. |
 | 7 | `fix/iroh-blobs-batch-status` | Adds `Blobs::status_many`, with batched store-actor status handling for the fs, mem and readonly-mem stores. Same files as row 6. | The iroh-docs `LiveActor` uses it to batch local completeness checks while scheduling many content downloads from a RemoteInsert burst (iroh-docs row 15). | `e20ff029` (rc.1); `60d098c9` on `upgrade/iroh-blobs-v0.103`, `c7c3e6c8` on `upgrade/iroh-blobs-v0.103.1` | carried | Medium conflict risk, same enums as row 6. Preserve response ordering and exact single-`status` semantics for complete, partial and missing blobs. Test: `cargo test -p iroh-blobs test_status_many`. |
 | 8 | `feat/multifetch` (based on `v0.103.0`) | Makes download progress observable. Root fetch in `Split` mode reports through the real sink instead of `Drain`, minus its legacy `Progress` offsets (`RootProgressFilter`), because split mode runs two independent counters and forwarding both made the offset go backwards (e.g. `[384, 1, 2, …]`). The split fan-in is drained after the futures stream ends (previously a fast final child lost its `PartComplete`). `TryProvider` moves after the `local.is_complete()` early return, so an already-resident request is not reported as an attempt. New additive `DownloadProgressItem::BytesTransferred(u64)` gives a per-attempt total of successfully decoded payload bytes (`Progress` is a cumulative offset that includes local bytes and is re-based per child, so it cannot be summed). Provider ordering, failover, resumption and split scheduling are unchanged. Files: `src/api/downloader.rs`, `src/util.rs`. | `aster_transport_core::CoreBlobsClient::run_download` folds the stream into `CoreFetchReport`, which `aster::Blobs::download_hash_from` / `download_hash_to_store_from` / `download_collection_from` expose to portal-sync for topology-aware provider ranking. | `adab99f1`..`02d6a2e3` / `a2e15663`..`7e0da6f7` (released as 0.103.1; earlier multifetch work as 0.103.0); on `upgrade/iroh-blobs-v0.103.1`: `031b0902`, `71588096`, `05683aec` | carried | Medium conflict risk in `execute_get` and `handle_download_split_impl`. Preserve `Progress` monotonicity in split mode; `BytesTransferred` comes from the returned `Stats::payload_bytes_read` on success and from the last raw sink value on failure. The statement order of `pool.get_or_connect` and the local scan is inert (`get_or_connect` is an `async fn`, so nothing happens until awaited); it is left as upstream has it and no overlap is claimed. Six tests in `api::downloader::tests` pin each behaviour. `BytesTransferred` is a transfer metric (the sum of what each attempt decoded), not a content size. Its shape changed in row 35. |
@@ -155,7 +155,15 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 1.4.0 wave (2026-10-21), current
+### noq 1.4.2 re-pin (2026-10-22), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.103.1` | `aster-iroh-blobs-v0.103.12-p1` | `63ec9fc4afc9f098c932ebc6443266509e64f420` | `upgrade/iroh-blobs-v0.103.1` |
+
+- **0.103.12-p1** (`63ec9fc4`): re-pin only (row 5), to iroh `91a92aa0` (1.4.0-p2), noq `a3c70b7a` (1.4.2, incremental BBRv3 packet history) and iroh-util `c9b91fce` (0.6.3-p4); the lock follows with no other moves. No source change; the crate stays 0.103.12 and publishes from the 0.103.12 code. Validation (`--locked --all-features`): lib 138 passed (3 ignored), blobs 3, tags 3, doc 17; clippy `--all-features --all-targets -D warnings` clean.
+
+### 1.4.0 wave (2026-10-21)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
