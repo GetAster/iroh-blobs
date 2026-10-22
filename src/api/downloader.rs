@@ -4,7 +4,7 @@ use std::{
     fmt::Debug,
     future::{Future, IntoFuture},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -1009,14 +1009,12 @@ async fn execute_get(
         // report the bytes it did transfer. On success the exact figure from
         // the returned stats replaces the last progress update.
         let attempt_counter = attempt.clone();
-        // Milliseconds from `started` to the attempt's latest payload progress,
-        // read by the stall guard.
-        let started = Instant::now();
-        let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let progress_clock = last_progress_ms.clone();
+        // The attempt's latest payload progress, read by the stall guard.
+        let clock = Arc::new(StallClock::new());
+        let progress_clock = clock.clone();
         let on_progress = move |x| {
             attempt_counter.set_payload_bytes(x);
-            progress_clock.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            progress_clock.touch();
             DownloadProgressItem::Progress(x + local_bytes)
         };
         let outcome = match &dialed.transform {
@@ -1025,16 +1023,9 @@ async fn execute_get(
                     conn.clone(),
                     local.missing(),
                     (&mut progress).with_map(on_progress),
+                    Some(&clock),
                 );
-                guard_attempt(
-                    get,
-                    idle_timeout,
-                    started,
-                    &last_progress_ms,
-                    conn,
-                    received,
-                )
-                .await
+                guard_attempt(get, idle_timeout, &clock, conn, received).await
             }
             Some(transform) => {
                 let get = remote.execute_get_sink(
@@ -1042,16 +1033,9 @@ async fn execute_get(
                         .with_tally(attempt.tally_for_transform()),
                     local.missing(),
                     (&mut progress).with_map(on_progress),
+                    Some(&clock),
                 );
-                guard_attempt(
-                    get,
-                    idle_timeout,
-                    started,
-                    &last_progress_ms,
-                    conn,
-                    received,
-                )
-                .await
+                guard_attempt(get, idle_timeout, &clock, conn, received).await
             }
         };
         let silent = matches!(outcome, Err(Abandoned::Silent));
@@ -1103,6 +1087,68 @@ enum Abandoned {
     Silent,
 }
 
+/// When a provider attempt last made payload progress, for the stall guard.
+///
+/// The clock runs only while the attempt waits on the provider. While the
+/// attempt waits on local work instead (the store importing what arrived, or
+/// the progress consumer taking an update), it is stopped, and it restarts
+/// when that work ends: a slow disk or a busy consumer is not a stalled
+/// provider. That includes the end of an attempt, after the provider has
+/// delivered every byte and the store is still committing them.
+#[derive(Debug)]
+pub(crate) struct StallClock {
+    started: Instant,
+    /// Milliseconds from `started` to the latest progress.
+    last_ms: AtomicU64,
+    /// Local waits in progress; while non-zero the clock is stopped.
+    local: AtomicUsize,
+}
+
+impl StallClock {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last_ms: AtomicU64::new(0),
+            local: AtomicUsize::new(0),
+        }
+    }
+
+    /// Record progress now.
+    fn touch(&self) {
+        let now = self.started.elapsed().as_millis() as u64;
+        self.last_ms.store(now, Ordering::SeqCst);
+    }
+
+    /// Stop the clock until the returned guard drops.
+    pub(crate) fn local(&self) -> LocalWait<'_> {
+        self.local.fetch_add(1, Ordering::SeqCst);
+        LocalWait(self)
+    }
+
+    /// When the attempt counts as stalled, or `None` while it waits on local
+    /// work.
+    fn stalled_at(&self, idle: Duration) -> Option<Instant> {
+        if self.local.load(Ordering::SeqCst) > 0 {
+            return None;
+        }
+        let last = Duration::from_millis(self.last_ms.load(Ordering::SeqCst));
+        Some(self.started + last + idle)
+    }
+}
+
+/// A local wait in progress: see [`StallClock::local`].
+#[derive(Debug)]
+pub(crate) struct LocalWait<'a>(&'a StallClock);
+
+impl Drop for LocalWait<'_> {
+    fn drop(&mut self) {
+        // Restart the clock before releasing it, so the guard never reads a
+        // time from before the local work with no local work in progress.
+        self.0.touch();
+        self.0.local.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The least time to wait for the provider to acknowledge a request.
 const MIN_SILENCE: Duration = Duration::from_secs(1);
 
@@ -1126,49 +1172,36 @@ fn silence_bound(conn: &iroh::endpoint::Connection, idle: Duration) -> Duration 
 async fn guard_attempt<T>(
     attempt: impl Future<Output = T>,
     idle_timeout: Option<Duration>,
-    started: Instant,
-    last_progress_ms: &AtomicU64,
+    clock: &StallClock,
     conn: &iroh::endpoint::Connection,
     received: u64,
 ) -> std::result::Result<T, Abandoned> {
     match idle_timeout {
         None => Ok(attempt.await),
-        Some(idle) => stall_guard(attempt, started, last_progress_ms, idle, conn, received).await,
+        Some(idle) => stall_guard(attempt, clock, idle, conn, received).await,
     }
 }
 
-/// Run one provider attempt, abandoning it once `idle` passes with no payload
-/// progress since `started` + `last_progress_ms`, or once the connection has
+/// Run one provider attempt, abandoning it once the provider has made no
+/// payload progress for `idle` on `clock`, or once the connection has
 /// received no datagram since `received` was read for [`silence_bound`].
 ///
 /// The clock covers the whole attempt, including opening the stream and
 /// waiting for the first chunk, so a provider that accepts and never answers
-/// is caught too.
+/// is caught too. It does not cover local work (see [`StallClock`]).
 async fn stall_guard<T>(
     attempt: impl Future<Output = T>,
-    started: Instant,
-    last_progress_ms: &AtomicU64,
+    clock: &StallClock,
     idle: Duration,
     conn: &iroh::endpoint::Connection,
     received: u64,
 ) -> std::result::Result<T, Abandoned> {
     let silence = async {
-        n0_future::time::sleep_until(started + silence_bound(conn, idle)).await;
+        n0_future::time::sleep_until(clock.started + silence_bound(conn, idle)).await;
         if conn.stats().udp_rx.datagrams == received {
             return;
         }
         future::pending::<()>().await
-    };
-    let watchdog = async {
-        loop {
-            let last = Duration::from_millis(last_progress_ms.load(Ordering::Relaxed));
-            let deadline = started + last + idle;
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            n0_future::time::sleep(deadline - now).await;
-        }
     };
     tokio::select! {
         biased;
@@ -1177,10 +1210,25 @@ async fn stall_guard<T>(
             tracing::debug!("provider acknowledged nothing since the request; connection lost");
             Err(Abandoned::Silent)
         }
-        () = watchdog => {
+        () = stalled(clock, idle) => {
             tracing::debug!(?idle, "provider attempt stalled; trying the next provider");
             Err(Abandoned::Stalled)
         }
+    }
+}
+
+/// Resolve once `clock` shows no progress for `idle` outside local work.
+async fn stalled(clock: &StallClock, idle: Duration) {
+    loop {
+        let now = Instant::now();
+        let wait = match clock.stalled_at(idle) {
+            Some(at) if now >= at => return,
+            Some(at) => at - now,
+            // Stopped for local work: when it ends the clock restarts, so the
+            // attempt cannot stall sooner than `idle` from now.
+            None => idle,
+        };
+        n0_future::time::sleep(wait).await;
     }
 }
 
@@ -2147,6 +2195,66 @@ mod tests {
         assert_eq!(reported.bytes, data.len() as u64);
         assert_eq!(store3.get_bytes(tt.hash).await?.deref(), data.as_slice());
         Ok(())
+    }
+
+    /// A consumer that stops taking progress is local work, not a stalled
+    /// provider: the attempt waits for it instead of failing the provider.
+    #[tokio::test]
+    async fn downloader_idle_timeout_waits_for_a_slow_progress_consumer() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("holder")).await?;
+        let (r3, store3, _, sp3) = node_test_setup_fs(testdir.path().join("consumer")).await?;
+        let data = vec![42u8; 1024 * 1024];
+        let tt = store1.add_slice(data.clone()).await?;
+        let holder = r1.endpoint().addr();
+        sp3.add_endpoint_info(holder.clone());
+        let swarm = Downloader::new(&store3, r3.endpoint());
+
+        let mut stream = swarm
+            .download_with_opts(
+                DownloadOptions::new(tt.hash, [holder.id], SplitStrategy::None)
+                    .with_provider_idle_timeout(IDLE),
+            )
+            .stream()
+            .await?;
+        // Take items up to the first payload progress, then stop reading for
+        // well over the idle timeout while the provider keeps sending.
+        let mut head = Vec::new();
+        loop {
+            let item = stream.next().await.ok_or("download ended early")?;
+            let payload = matches!(item, DownloadProgressItem::Progress(_));
+            head.push(item);
+            if payload {
+                break;
+            }
+        }
+        tokio::time::sleep(IDLE * 4).await;
+        let rest = n0_future::stream::iter(head).chain(stream);
+        let reported = tokio::time::timeout(BOUND, collect(rest)).await?;
+
+        assert_eq!(reported.errors, 0);
+        assert_eq!(reported.tried, vec![holder.id]);
+        assert!(reported.failed.is_empty(), "failed {:?}", reported.failed);
+        assert_eq!(reported.completed, 1);
+        assert_eq!(reported.bytes, data.len() as u64);
+        assert_eq!(store3.get_bytes(tt.hash).await?.deref(), data.as_slice());
+        Ok(())
+    }
+
+    /// Local work stops the stall clock, however long it takes, and the clock
+    /// restarts from where the work ended.
+    #[tokio::test]
+    async fn stall_clock_stops_during_local_work() {
+        const IDLE: std::time::Duration = std::time::Duration::from_millis(100);
+        let clock = super::StallClock::new();
+        let local = clock.local();
+        let held = tokio::time::timeout(IDLE * 3, super::stalled(&clock, IDLE)).await;
+        assert!(held.is_err(), "stalled while waiting on local work");
+        let released = n0_future::time::Instant::now();
+        drop(local);
+        super::stalled(&clock, IDLE).await;
+        // The clock keeps milliseconds, so allow for one lost to rounding.
+        assert!(released.elapsed() + std::time::Duration::from_millis(1) >= IDLE);
     }
 
     /// Split mode threads the timeout through the root fetch and every child.
