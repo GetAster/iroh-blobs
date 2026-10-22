@@ -20,7 +20,10 @@ use n0_future::{io, Stream, StreamExt};
 use ref_cast::RefCast;
 use tracing::{debug, trace};
 
-use super::blobs::{Bitfield, ExportBaoOptions};
+use super::{
+    blobs::{Bitfield, ExportBaoOptions},
+    downloader::StallClock,
+};
 use crate::{
     api::{self, blobs::WriteProgress, ApiClient, Store},
     get::{
@@ -531,7 +534,7 @@ impl Remote {
             return Ok(Default::default());
         }
         let request = local.missing();
-        let stats = self.execute_get_sink(sp, request, progress).await?;
+        let stats = self.execute_get_sink(sp, request, progress, None).await?;
         Ok(stats)
     }
 
@@ -646,7 +649,10 @@ impl Remote {
         let sink = TokioMpscSenderSink(tx).with_map(GetProgressItem::Progress);
         let this = self.clone();
         let fut = async move {
-            let res = this.execute_get_sink(conn, request, sink).await.into();
+            let res = this
+                .execute_get_sink(conn, request, sink, None)
+                .await
+                .into();
             tx2.send(res).await.ok();
         };
         GetProgress {
@@ -663,11 +669,15 @@ impl Remote {
     /// This will download the data again even if the data is locally present.
     ///
     /// This will return the stats of the download.
+    ///
+    /// With `clock`, the waits on local work (the store and `progress`) stop
+    /// it, so a downloader stall guard does not blame them on the provider.
     pub(crate) async fn execute_get_sink(
         &self,
         conn: impl GetStreamPair,
         request: GetRequest,
         mut progress: impl Sink<u64, Error = irpc::channel::SendError>,
+        clock: Option<&StallClock>,
     ) -> GetResult<Stats> {
         let store = self.store();
         let root = request.hash;
@@ -688,7 +698,7 @@ impl Remote {
         {
             ConnectedNext::StartRoot(at_start_root) => {
                 let header = at_start_root.next();
-                let end = get_blob_ranges_impl(header, root, store, &mut progress).await?;
+                let end = get_blob_ranges_impl(header, root, store, &mut progress, clock).await?;
                 match end.next() {
                     EndBlobNext::MoreChildren(at_start_child) => Ok(at_start_child),
                     EndBlobNext::Closing(at_closing) => Err(at_closing),
@@ -708,18 +718,24 @@ impl Remote {
                         Err(at_closing) => break at_closing,
                     };
                     let offset = at_start_child.offset() - 1;
-                    let hash = hash_seq.get(offset).await.map_err(|e| match e {
-                        e @ LazyHashSeqError::InvalidHashSeq { .. } => {
-                            e!(GetError::BadRequest, e.into())
-                        }
-                        e => e!(GetError::LocalFailure, e.into()),
-                    })?;
+                    // Reading the next window of the collection root is local
+                    // work: the stall clock must not run while the store answers.
+                    let hash = {
+                        let _local = clock.map(StallClock::local);
+                        hash_seq.get(offset).await.map_err(|e| match e {
+                            e @ LazyHashSeqError::InvalidHashSeq { .. } => {
+                                e!(GetError::BadRequest, e.into())
+                            }
+                            e => e!(GetError::LocalFailure, e.into()),
+                        })?
+                    };
                     let Some(hash) = hash else {
                         break at_start_child.finish();
                     };
                     trace!("getting child {offset} {}", hash.fmt_short());
                     let header = at_start_child.next(hash);
-                    let end = get_blob_ranges_impl(header, hash, store, &mut progress).await?;
+                    let end =
+                        get_blob_ranges_impl(header, hash, store, &mut progress, clock).await?;
                     next_child = match end.next() {
                         EndBlobNext::MoreChildren(at_start_child) => Ok(at_start_child),
                         EndBlobNext::Closing(at_closing) => Err(at_closing),
@@ -784,7 +800,8 @@ impl Remote {
                     };
                     trace!("getting child {offset} {}", hash.fmt_short());
                     let header = at_start_child.next(hash);
-                    let end = get_blob_ranges_impl(header, hash, store, &mut progress).await?;
+                    let end =
+                        get_blob_ranges_impl(header, hash, store, &mut progress, None).await?;
                     next_child = match end.next() {
                         EndBlobNext::MoreChildren(at_start_child) => Ok(at_start_child),
                         EndBlobNext::Closing(at_closing) => Err(at_closing),
@@ -880,6 +897,7 @@ async fn get_blob_ranges_impl<R: RecvStream>(
     hash: Hash,
     store: &Store,
     mut progress: impl Sink<u64, Error = irpc::channel::SendError>,
+    clock: Option<&StallClock>,
 ) -> GetResult<AtEndBlob<R>> {
     let (mut content, size) = header
         .next()
@@ -898,15 +916,20 @@ async fn get_blob_ranges_impl<R: RecvStream>(
     };
     let buffer_size = get_buffer_size(size);
     trace!(%size, %buffer_size, "get blob");
-    let handle = store
-        .import_bao(hash, size, buffer_size)
-        .await
-        .map_err(|e| e!(GetError::LocalFailure, e.into()))?;
+    let handle = {
+        let _local = clock.map(StallClock::local);
+        store
+            .import_bao(hash, size, buffer_size)
+            .await
+            .map_err(|e| e!(GetError::LocalFailure, e.into()))?
+    };
     let write = async move {
         GetResult::Ok(loop {
             match content.next().await {
                 BlobContentNext::More((next, res)) => {
                     let item = res.map_err(|e| e!(GetError::Decode, e))?;
+                    // Handing the item on waits on the consumer and the store.
+                    let _local = clock.map(StallClock::local);
                     progress
                         .send(next.stats().payload_bytes_read)
                         .await
@@ -920,7 +943,9 @@ async fn get_blob_ranges_impl<R: RecvStream>(
                 }
                 BlobContentNext::Done(end) => {
                     drop(handle.tx);
-                    break end;
+                    // Everything has arrived; until the store has committed
+                    // it, the attempt waits on local work only.
+                    break (end, clock.map(StallClock::local));
                 }
             }
         })
@@ -937,7 +962,8 @@ async fn get_blob_ranges_impl<R: RecvStream>(
             })?
             .map_err(|e| e!(GetError::LocalFailure, e.into()))
     };
-    let (_, end) = tokio::try_join!(complete, write)?;
+    let (_, (end, committing)) = tokio::try_join!(complete, write)?;
+    drop(committing);
     Ok(end)
 }
 
