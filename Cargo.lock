@@ -709,7 +709,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1598,8 +1598,8 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "iroh"
-version = "1.4.0"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=91a92aa02bc2a06af613f3a708f84f51fe30d386#91a92aa02bc2a06af613f3a708f84f51fe30d386"
+version = "1.4.1"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=68b684ea3605fb48a4e09d026b51e1673a83d18d#68b684ea3605fb48a4e09d026b51e1673a83d18d"
 dependencies = [
  "backon",
  "blake3",
@@ -1647,8 +1647,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-base"
-version = "1.4.0"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=91a92aa02bc2a06af613f3a708f84f51fe30d386#91a92aa02bc2a06af613f3a708f84f51fe30d386"
+version = "1.4.1"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=68b684ea3605fb48a4e09d026b51e1673a83d18d#68b684ea3605fb48a4e09d026b51e1673a83d18d"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1721,8 +1721,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.4.0"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=91a92aa02bc2a06af613f3a708f84f51fe30d386#91a92aa02bc2a06af613f3a708f84f51fe30d386"
+version = "1.4.1"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=68b684ea3605fb48a4e09d026b51e1673a83d18d#68b684ea3605fb48a4e09d026b51e1673a83d18d"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1803,8 +1803,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.4.0"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=91a92aa02bc2a06af613f3a708f84f51fe30d386#91a92aa02bc2a06af613f3a708f84f51fe30d386"
+version = "1.4.1"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=68b684ea3605fb48a4e09d026b51e1673a83d18d#68b684ea3605fb48a4e09d026b51e1673a83d18d"
 dependencies = [
  "blake3",
  "bytes",
@@ -1874,7 +1874,7 @@ dependencies = [
 [[package]]
 name = "iroh-util"
 version = "0.6.3"
-source = "git+https://forge.emrul.dev/Aster/iroh-util.git?rev=c9b91fce2eb8c1a30cfb27b24888f1b0ecaab556#c9b91fce2eb8c1a30cfb27b24888f1b0ecaab556"
+source = "git+https://forge.emrul.dev/Aster/iroh-util.git?rev=16a93b49b482c4e7874ca1e91cae72f2cfb2616c#16a93b49b482c4e7874ca1e91cae72f2cfb2616c"
 dependencies = [
  "derive_more",
  "iroh",
