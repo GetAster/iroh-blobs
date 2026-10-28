@@ -709,7 +709,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1598,8 +1598,8 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "iroh"
-version = "1.4.2001"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=0739c259754353a455745273d4f7673e6d45570c#0739c259754353a455745273d4f7673e6d45570c"
+version = "1.4.2002"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=34ad5b111e876ad8ad554f73a3b8e93b00fbc327#34ad5b111e876ad8ad554f73a3b8e93b00fbc327"
 dependencies = [
  "backon",
  "blake3",
@@ -1647,8 +1647,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-base"
-version = "1.4.2001"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=0739c259754353a455745273d4f7673e6d45570c#0739c259754353a455745273d4f7673e6d45570c"
+version = "1.4.2002"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=34ad5b111e876ad8ad554f73a3b8e93b00fbc327#34ad5b111e876ad8ad554f73a3b8e93b00fbc327"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1721,8 +1721,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.4.2001"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=0739c259754353a455745273d4f7673e6d45570c#0739c259754353a455745273d4f7673e6d45570c"
+version = "1.4.2002"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=34ad5b111e876ad8ad554f73a3b8e93b00fbc327#34ad5b111e876ad8ad554f73a3b8e93b00fbc327"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1803,8 +1803,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.4.2001"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=0739c259754353a455745273d4f7673e6d45570c#0739c259754353a455745273d4f7673e6d45570c"
+version = "1.4.2002"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=34ad5b111e876ad8ad554f73a3b8e93b00fbc327#34ad5b111e876ad8ad554f73a3b8e93b00fbc327"
 dependencies = [
  "blake3",
  "bytes",
@@ -1874,7 +1874,7 @@ dependencies = [
 [[package]]
 name = "iroh-util"
 version = "0.6.3"
-source = "git+https://forge.emrul.dev/Aster/iroh-util.git?rev=502558d27d8ff0fc6645bac9c69c2bea159e3c34#502558d27d8ff0fc6645bac9c69c2bea159e3c34"
+source = "git+https://forge.emrul.dev/Aster/iroh-util.git?rev=3467b0c117318da67cd5b5cccfc4cb89c0f6e55d#3467b0c117318da67cd5b5cccfc4cb89c0f6e55d"
 dependencies = [
  "derive_more",
  "iroh",
@@ -2435,8 +2435,8 @@ dependencies = [
 
 [[package]]
 name = "noq"
-version = "1.4.2"
-source = "git+https://forge.emrul.dev/Aster/noq.git?rev=a3c70b7afe459cbf01122928f4f90d72063ab972#a3c70b7afe459cbf01122928f4f90d72063ab972"
+version = "1.4.3"
+source = "git+https://forge.emrul.dev/Aster/noq.git?rev=de89867c975192d69438164bada087506133c5a4#de89867c975192d69438164bada087506133c5a4"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2456,8 +2456,8 @@ dependencies = [
 
 [[package]]
 name = "noq-proto"
-version = "1.4.2"
-source = "git+https://forge.emrul.dev/Aster/noq.git?rev=a3c70b7afe459cbf01122928f4f90d72063ab972#a3c70b7afe459cbf01122928f4f90d72063ab972"
+version = "1.4.3"
+source = "git+https://forge.emrul.dev/Aster/noq.git?rev=de89867c975192d69438164bada087506133c5a4#de89867c975192d69438164bada087506133c5a4"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -2484,8 +2484,8 @@ dependencies = [
 
 [[package]]
 name = "noq-udp"
-version = "1.4.2"
-source = "git+https://forge.emrul.dev/Aster/noq.git?rev=a3c70b7afe459cbf01122928f4f90d72063ab972#a3c70b7afe459cbf01122928f4f90d72063ab972"
+version = "1.4.3"
+source = "git+https://forge.emrul.dev/Aster/noq.git?rev=de89867c975192d69438164bada087506133c5a4#de89867c975192d69438164bada087506133c5a4"
 dependencies = [
  "cfg_aliases",
  "libc",
