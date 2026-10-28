@@ -7,7 +7,7 @@ This repository is Aster's fork of [n0-computer/iroh-blobs](https://github.com/n
 - `main` is upstream `main` plus one commit: the Aster README preamble and this ledger. Nothing is built from `main`. It is refreshed with `git merge upstream/main` and is never reset or force-pushed. Ledger edits are commits on `main`, never on `upgrade/*`.
 - `upgrade/<repo>-v<upstream version>` (for example `upgrade/iroh-v1.4.0`, `upgrade/iroh-blobs-v0.103.1`) is the patched integration line: the upstream release plus the patches in this ledger. A new upstream base always gets a new branch, cut from the upstream release tag; Aster-only fixes and re-pins append to the current branch. Per-minor names (`upgrade/iroh-blobs-v0.103`, `upgrade/salvo-v1.0`, …) are historical. Consumers pin commits on it. Published `upgrade/*` branches and tags are never rewritten; a failed attempt is superseded by new commits and a new version.
 - Topic branches carry one change each, are named for the change (for example `feat/read-into`, `security/plumtree-bounds`), are based on the upstream release tag (or, for a patch that builds on another, on that prerequisite patch's commit, which its row names), and are cherry-picked with `git cherry-pick -x` onto the upgrade branch, so every upgrade-branch commit names its source. A topic branch a row names is not rewritten; re-cutting it onto a new upstream base takes a versioned name, `<topic>-v<upstream version>`.
-- Version: the upstream version if Aster's registry has never served that version or a higher one in the series; otherwise the next patch above Aster's highest published version. A re-pin without a code change keeps the version and takes the tag suffix `-p<n>`.
+- Version (option E, from 2026-10-25): a release with Aster patches publishes as `major.minor.P` with `P = 1000 * (upstream_patch + 1) + n`, where `n` (1 to 999) counts Aster patch releases on that upstream version (upstream 0.103.1 plus the first is `0.103.2001`), so it never collides with a crates.io release. Canonical rule: `_internal/docs/aster-rpc/261003_fork-pin-upgrade-runbook.md`; `publish-native-stack.py check` enforces it. Versions already published (0.103.12 and earlier) are grandfathered. A re-pin without a code change keeps the version and takes the tag suffix `-p<n>`.
 - Tags: `aster-<repo>-v<published version>` (re-pins `aster-<repo>-v<published version>-p<n>`), created only after the Aster consumer trial passes against those exact commits, because tags cannot be moved.
 - The fork manifest is `iroh-fork-manifest.toml` in the Aster repository (the only copy).
 - Aster does not submit patches upstream; upstream maintainers are welcome to take any patch here.
@@ -24,16 +24,16 @@ Historical and current tag schemes in this repository:
 | Upstream base | `v0.103.1` |
 | Integration branch | `upgrade/iroh-blobs-v0.103.1` (cut from `v0.103.1`; `upgrade/iroh-blobs-v0.103` is the historical per-minor line on `v0.103.0`) |
 | Tag | `aster-iroh-blobs-v0.103.12-p4` |
-| Pinned commit | `9b5c9831bebff89cb8ea1ea333b01a07520ec63d` |
+| Pinned commit | `825b70e865d81e12891c77ae370bdd8de11aa393` |
 | Crate version | 0.103.12 (workspace spec `iroh-blobs = "0.103.12"`; the registry already served 0.103.11, so the row 26 stall-clock fix publishes 0.103.12) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-blobs.git` |
 
-The fork's own `[patch.crates-io]` (row 5, re-pinned by `9b5c9831`) pins iroh `34ad5b11` (1.4.2002), noq `de89867c` (1.4.3) and iroh-util `3467b0c1` (0.6.3-p7), all matching the manifest. Upstream `v0.103.1` requires iroh-util 0.6.0; `15d47bdb` raises the requirement to 0.6.3 for row 34.
+The fork's own `[patch.crates-io]` (row 5, re-pinned by `825b70e8`) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001) and iroh-util `b28211ec` (0.6.3-p7), all matching the manifest. Upstream `v0.103.1` requires iroh-util 0.6.0; `15d47bdb` raises the requirement to 0.6.3 for row 34.
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "9b5c9831bebff89cb8ea1ea333b01a07520ec63d" }
+iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "825b70e865d81e12891c77ae370bdd8de11aa393" }
 ```
 
 ## Patches
@@ -101,7 +101,7 @@ git switch -c upgrade/iroh-blobs-v<upstream version> <upstream-tag>
 # cherry-pick -x each row's commits in the order above
 # version bump, only if the version rule requires it (Aster's registry has already
 # served <upstream version> or higher in the series, as it has 0.103.0..0.103.11):
-# set the crate to the next patch above Aster's highest published, then
+# set the crate to the next option E version (`1000 * (upstream_patch + 1) + n`), then
 git commit -am "chore: release <published version>"
 git push origin upgrade/iroh-blobs-v<upstream version>
 # do not tag yet: tag after the consumer trial (below)
@@ -109,7 +109,7 @@ git push origin upgrade/iroh-blobs-v<upstream version>
 
 Prefer `cherry-pick -x`; if a patch no longer applies, treat the "What" and "Conflict or porting notes" columns as the specification. Published `upgrade/*` branches and tags are never rewritten; a failed attempt is superseded by new commits and a new version.
 
-An Aster-only fix on the current base is a topic branch based on the upstream release tag (or on the commit of the patch it builds on, as rows 26–35 stack), cherry-picked `-x` onto the current upgrade branch, followed by a version-bump commit to the next patch above Aster's highest published version (as 0.103.6 through 0.103.10 were cut). A re-pin without a code change (row 5 only) is a commit on the current upgrade branch with no version bump, tagged `aster-iroh-blobs-v<current version>-p<n>` after the consumer trial (as the `-p1` sweep tags were).
+An Aster-only fix on the current base is a topic branch based on the upstream release tag (or on the commit of the patch it builds on, as rows 26–35 stack), cherry-picked `-x` onto the current upgrade branch, followed by a version-bump commit to the next option E version (`1000 * (upstream_patch + 1) + n`) (as 0.103.6 through 0.103.10 were cut). A re-pin without a code change (row 5 only) is a commit on the current upgrade branch with no version bump, tagged `aster-iroh-blobs-v<current version>-p<n>` after the consumer trial (as the `-p1` sweep tags were).
 
 Validate in this repository:
 
@@ -155,13 +155,13 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### iroh 1.4.2002 and noq 1.4.3 re-pin (2026-10-28), current
+### iroh 1.4.2002 and noq 1.4.1001 re-pin (2026-10-28), current
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
-| `v0.103.1` | `aster-iroh-blobs-v0.103.12-p4` | `9b5c9831bebff89cb8ea1ea333b01a07520ec63d` | `upgrade/iroh-blobs-v0.103.1` |
+| `v0.103.1` | `aster-iroh-blobs-v0.103.12-p4` | `825b70e865d81e12891c77ae370bdd8de11aa393` | `upgrade/iroh-blobs-v0.103.1` |
 
-- **`aster-iroh-blobs-v0.103.12-p4`** (`9b5c9831`): re-pin only, to iroh `34ad5b11` (Aster iroh 1.4.2002), noq `de89867c` (Aster noq 1.4.3) and iroh-util `3467b0c1` (0.6.3-p7). Only Cargo.toml's `[patch.crates-io]` and Cargo.lock change (iroh, iroh-base, iroh-dns, iroh-relay to 1.4.2002; noq, noq-proto, noq-udp to 1.4.3); the crate is not republished. Validation: `cargo test --locked --all-features`, 161 passed, 0 failed (3 ignored); clippy `--all-features --all-targets -D warnings` clean. The tag is created after the Aster candidate passes.
+- **`aster-iroh-blobs-v0.103.12-p4`** (`825b70e8`): re-pin only, to iroh `9ba1447d` (Aster iroh 1.4.2002), noq `379f73677c` (Aster noq 1.4.1001) and iroh-util `b28211ec` (0.6.3-p7). Only Cargo.toml's `[patch.crates-io]` and Cargo.lock change (iroh, iroh-base, iroh-dns, iroh-relay to 1.4.2002; noq, noq-proto, noq-udp to 1.4.1001); the crate is not republished. Validation: `cargo test --locked --all-features`, 161 passed, 0 failed (3 ignored); clippy `--all-features --all-targets -D warnings` clean. The earlier commit `9b5c9831` (iroh `34ad5b11`, noq 1.4.3) was superseded by `825b70e8` before tagging, because noq's version moved from 1.4.3 to 1.4.1001 under the fork version rule (option E); nothing at it was tagged or published.
 
 ### iroh 1.4.2001 re-pin (2026-10-25)
 
