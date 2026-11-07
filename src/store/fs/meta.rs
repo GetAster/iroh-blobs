@@ -33,7 +33,10 @@ use crate::{
 };
 mod proto;
 pub use proto::*;
+mod migrate;
+pub(crate) mod row;
 pub(crate) mod tables;
+use row::{as_slices, to_owned_state};
 use tables::{ReadOnlyTables, ReadableTables, Tables};
 use tracing::{debug, error, info_span, trace, Span};
 
@@ -210,21 +213,7 @@ fn handle_get(cmd: Get, tables: &impl ReadableTables) -> ActorResult<()> {
         tx.send(GetResult { state: Ok(None) });
         return Ok(());
     };
-    let entry = entry.value();
-    let entry = match entry {
-        EntryState::Complete {
-            data_location,
-            outboard_location,
-        } => {
-            let data_location = load_data(tables, data_location, &hash)?;
-            let outboard_location = load_outboard(tables, outboard_location, &hash)?;
-            EntryState::Complete {
-                data_location,
-                outboard_location,
-            }
-        }
-        EntryState::Partial { size } => EntryState::Partial { size },
-    };
+    let entry = to_owned_state(entry.value());
     tx.send(GetResult {
         state: Ok(Some(entry)),
     });
@@ -242,7 +231,7 @@ fn handle_dump(cmd: Dump, tables: &impl ReadableTables) -> ActorResult<()> {
         let (k, v) = e.map_err(|e| e!(ActorError::Storage, e))?;
         let k = k.value();
         let v = v.value();
-        println!("blobs: {} -> {:?}", k.to_hex(), v);
+        println!("blobs: {} -> {}", k.to_hex(), v.fmt_short());
     }
     for e in tables
         .tags()
@@ -253,26 +242,6 @@ fn handle_dump(cmd: Dump, tables: &impl ReadableTables) -> ActorResult<()> {
         let k = k.value();
         let v = v.value();
         println!("tags: {k} -> {v:?}");
-    }
-    for e in tables
-        .inline_data()
-        .iter()
-        .map_err(|e| e!(ActorError::Storage, e))?
-    {
-        let (k, v) = e.map_err(|e| e!(ActorError::Storage, e))?;
-        let k = k.value();
-        let v = v.value();
-        println!("inline_data: {} -> {:?}", k.to_hex(), v.len());
-    }
-    for e in tables
-        .inline_outboard()
-        .iter()
-        .map_err(|e| e!(ActorError::Storage, e))?
-    {
-        let (k, v) = e.map_err(|e| e!(ActorError::Storage, e))?;
-        let k = k.value();
-        let v = v.value();
-        println!("inline_outboard: {} -> {:?}", k.to_hex(), v.len());
     }
     cmd.tx.send(Ok(()));
     Ok(())
@@ -328,21 +297,9 @@ fn blob_status(tables: &impl ReadableTables, hash: Hash) -> ActorResult<BlobStat
         {
             Some(entry) => match entry.value() {
                 EntryState::Complete { data_location, .. } => match data_location {
-                    DataLocation::Inline(_) => {
-                        let Some(data) = tables
-                            .inline_data()
-                            .get(hash)
-                            .map_err(|e| e!(ActorError::Storage, e))?
-                        else {
-                            return Err(ActorError::inconsistent(format!(
-                                "inconsistent database state: {} not found",
-                                hash.to_hex()
-                            )));
-                        };
-                        BlobStatus::Complete {
-                            size: data.value().len() as u64,
-                        }
-                    }
+                    DataLocation::Inline(data) => BlobStatus::Complete {
+                        size: data.len() as u64,
+                    },
                     DataLocation::Owned(size) => BlobStatus::Complete { size },
                     DataLocation::External(_, size) => BlobStatus::Complete { size },
                 },
@@ -407,18 +364,7 @@ async fn handle_get_blob_bytes(msg: BlobBytesMsg, tables: &impl ReadableTables) 
         {
             Some(entry) => match entry.value() {
                 EntryState::Complete { data_location, .. } => match data_location {
-                    DataLocation::Inline(_) => {
-                        let Some(data) = tables
-                            .inline_data()
-                            .get(hash)
-                            .map_err(|e| e!(ActorError::Storage, e))?
-                        else {
-                            return Err(ActorError::inconsistent(format!(
-                                "inconsistent database state: {} not found",
-                                hash.to_hex()
-                            )));
-                        };
-                        let data = data.value();
+                    DataLocation::Inline(data) => {
                         if Hash::new(data) != hash {
                             return Err(ActorError::inconsistent(format!(
                                 "inline data hash mismatch for {}",
@@ -490,25 +436,7 @@ fn handle_update(cmd: Update, protection: &mut Protection, tables: &mut Tables) 
     } = cmd;
     let _ = protection.protected.insert(hash);
     trace!("updating hash {} to {}", hash.to_hex(), state.fmt_short());
-    let old_entry_opt = tables.blobs.get(hash)?.map(|e| e.value());
-    let (state, data, outboard): (_, Option<Bytes>, Option<Bytes>) = match state {
-        EntryState::Complete {
-            data_location,
-            outboard_location,
-        } => {
-            let (data_location, data) = data_location.split_inline_data();
-            let (outboard_location, outboard) = outboard_location.split_inline_data();
-            (
-                EntryState::Complete {
-                    data_location,
-                    outboard_location,
-                },
-                data,
-                outboard,
-            )
-        }
-        EntryState::Partial { size } => (EntryState::Partial { size }, None, None),
-    };
+    let old_entry_opt = tables.blobs.get(hash)?.map(|e| to_owned_state(e.value()));
     let state = match old_entry_opt {
         Some(old) => {
             let partial_to_complete = old.is_partial() && state.is_complete();
@@ -524,20 +452,8 @@ fn handle_update(cmd: Update, protection: &mut Protection, tables: &mut Tables) 
     };
     tables
         .blobs
-        .insert(hash, state)
+        .insert(hash, as_slices(&state))
         .map_err(|e| e!(ActorError::Storage, e))?;
-    if let Some(data) = data {
-        tables
-            .inline_data
-            .insert(hash, data.as_ref())
-            .map_err(|e| e!(ActorError::Storage, e))?;
-    }
-    if let Some(outboard) = outboard {
-        tables
-            .inline_outboard
-            .insert(hash, outboard.as_ref())
-            .map_err(|e| e!(ActorError::Storage, e))?;
-    }
     if let Some(tx) = tx {
         tx.send(Ok(()));
     }
@@ -550,40 +466,10 @@ fn handle_set(cmd: Set, protection: &mut Protection, tables: &mut Tables) -> Act
         state, hash, tx, ..
     } = cmd;
     let _ = protection.protected.insert(hash);
-    let (state, data, outboard): (_, Option<Bytes>, Option<Bytes>) = match state {
-        EntryState::Complete {
-            data_location,
-            outboard_location,
-        } => {
-            let (data_location, data) = data_location.split_inline_data();
-            let (outboard_location, outboard) = outboard_location.split_inline_data();
-            (
-                EntryState::Complete {
-                    data_location,
-                    outboard_location,
-                },
-                data,
-                outboard,
-            )
-        }
-        EntryState::Partial { size } => (EntryState::Partial { size }, None, None),
-    };
     tables
         .blobs
-        .insert(hash, state)
+        .insert(hash, as_slices(&state))
         .map_err(|e| e!(ActorError::Storage, e))?;
-    if let Some(data) = data {
-        tables
-            .inline_data
-            .insert(hash, data.as_ref())
-            .map_err(|e| e!(ActorError::Storage, e))?;
-    }
-    if let Some(outboard) = outboard {
-        tables
-            .inline_outboard
-            .insert(hash, outboard.as_ref())
-            .map_err(|e| e!(ActorError::Storage, e))?;
-    }
     tx.send(Ok(()));
     Ok(())
 }
@@ -641,6 +527,7 @@ impl Actor {
             }
             Err(err) => return Err(err.into()),
         };
+        migrate::migrate(&db, migrate::Chunk::default())?;
         let tx = db.begin_write()?;
         let ftx = ds.begin_write();
         Tables::new(&tx, &ftx)?;
@@ -713,9 +600,7 @@ impl Actor {
                     } => {
                         trace!("delete {hash}: currently complete. will be deleted.");
                         match data_location {
-                            DataLocation::Inline(_) => {
-                                tables.inline_data.remove(hash)?;
-                            }
+                            DataLocation::Inline(_) => {}
                             DataLocation::Owned(_) => {
                                 // mark the data for deletion
                                 tables.ftx.delete(hash, [BaoFilePart::Data]);
@@ -723,9 +608,7 @@ impl Actor {
                             DataLocation::External(_, _) => {}
                         }
                         match outboard_location {
-                            OutboardLocation::Inline(_) => {
-                                tables.inline_outboard.remove(hash)?;
-                            }
+                            OutboardLocation::Inline(_) => {}
                             OutboardLocation::Owned => {
                                 // mark the outboard for deletion
                                 tables.ftx.delete(hash, [BaoFilePart::Outboard]);
@@ -1104,54 +987,6 @@ impl Drop for DbWrapper {
             debug!("database closed");
         }
     }
-}
-
-fn load_data(
-    tables: &impl ReadableTables,
-    location: DataLocation<(), u64>,
-    hash: &Hash,
-) -> ActorResult<DataLocation<Bytes, u64>> {
-    Ok(match location {
-        DataLocation::Inline(()) => {
-            let Some(data) = tables
-                .inline_data()
-                .get(hash)
-                .map_err(|e| e!(ActorError::Storage, e))?
-            else {
-                return Err(ActorError::inconsistent(format!(
-                    "inconsistent database state: {} should have inline data but does not",
-                    hash.to_hex()
-                )));
-            };
-            DataLocation::Inline(Bytes::copy_from_slice(data.value()))
-        }
-        DataLocation::Owned(data_size) => DataLocation::Owned(data_size),
-        DataLocation::External(paths, data_size) => DataLocation::External(paths, data_size),
-    })
-}
-
-fn load_outboard(
-    tables: &impl ReadableTables,
-    location: OutboardLocation,
-    hash: &Hash,
-) -> ActorResult<OutboardLocation<Bytes>> {
-    Ok(match location {
-        OutboardLocation::NotNeeded => OutboardLocation::NotNeeded,
-        OutboardLocation::Inline(_) => {
-            let Some(outboard) = tables
-                .inline_outboard()
-                .get(hash)
-                .map_err(|e| e!(ActorError::Storage, e))?
-            else {
-                return Err(ActorError::inconsistent(format!(
-                    "inconsistent database state: {} should have inline outboard but does not",
-                    hash.to_hex()
-                )));
-            };
-            OutboardLocation::Inline(Bytes::copy_from_slice(outboard.value()))
-        }
-        OutboardLocation::Owned => OutboardLocation::Owned,
-    })
 }
 
 pub(crate) fn raw_outboard_size(size: u64) -> u64 {
