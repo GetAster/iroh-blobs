@@ -95,7 +95,7 @@ impl Default for BatchOptions {
         Self {
             max_read_batch: 10000,
             max_read_duration: Duration::from_secs(1),
-            max_write_batch: 1000,
+            max_write_batch: 10000,
             max_write_duration: Duration::from_millis(500),
         }
     }
