@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.103.1` |
 | Integration branch | `upgrade/iroh-blobs-v0.103.1` (cut from `v0.103.1`; `upgrade/iroh-blobs-v0.103` is the historical per-minor line on `v0.103.0`) |
-| Tag | `aster-iroh-blobs-v0.103.2001` |
-| Pinned commit | `d5116409d990f1b1a79be7c58c4d71d4d557fc96` |
-| Crate version | 0.103.2001 (workspace spec `iroh-blobs = "0.103.2001"`) |
+| Tag | `aster-iroh-blobs-v0.103.2002` |
+| Pinned commit | `e7937c995dd0b947234e5759a2a81d5609fa900e` |
+| Crate version | 0.103.2002 (workspace spec `iroh-blobs = "0.103.2002"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-blobs.git` |
 
 The fork's own `[patch.crates-io]` (row 5, re-pinned by `825b70e8`) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001) and iroh-util `b28211ec` (0.6.3-p7), all matching the manifest. Upstream `v0.103.1` requires iroh-util 0.6.0; `15d47bdb` raises the requirement to 0.6.3 for row 34.
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 5, re-pinned by `825b70e8`) pins iroh `9
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "d5116409d990f1b1a79be7c58c4d71d4d557fc96" }
+iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "e7937c995dd0b947234e5759a2a81d5609fa900e" }
 ```
 
 ## Patches
@@ -55,6 +55,8 @@ Row numbers are stable patch ids shared across Aster's iroh-family forks (iroh, 
 | 38 | none of its own: carried on `fix/iroh-blobs-batch-small-reads` (original `8707ffa4`, rc.1; backfilled 2026-10-21) | Re-exports `gc_run_once` from `iroh_blobs::store`, next to `GcConfig`, `ProtectCb` and `ProtectOutcome`, so an embedder can run one synchronous GC pass. One line. File: `src/store/mod.rs`. | `aster_transport_core` imports it (`core/src/lib.rs`, `use iroh_blobs::store::{gc_run_once as blobs_gc_run_once, …}`) for the manual GC sweep that portal-sync's retention tests and `gc_run_once` cadence drive (row 23). | `8707ffa4` / `45056b3a` (in 0.103.0); on `upgrade/iroh-blobs-v0.103.1`: `e698ced3` (`-x` of both) | carried | Trivial conflict risk (one `pub use` line). Missing from this ledger until 2026-10-21, though carried since the rc.1 port. Drop the row if upstream exports `gc_run_once`. |
 | 39 | none recorded (`48671037`, `55cd02e3`) | A get-many download runs over one stream per provider attempt. The downloader ran a `GetManyRequest` with `SplitStrategy::None` as one stream per hash; `execute_get_many` now asks each provider, in order, for what is still missing of every blob it has not yet answered for, over one stream (plain or transformed). `Remote::execute_get_many_children` reports each child as it starts and once it is stored; the downloader turns that into per-blob `TryProvider`, `BytesTransferred` (stream wire bytes split at child boundaries) and `PartComplete`, keyed by one `GetRequest` per hash. A provider that lacks a blob resets the stream at it, which discards blobs sent but not yet read, so the blobs stored before a reset count as answered and the rest are asked again; an attempt that stored nothing is followed by a plain single-blob get, which names the failure and which providers predating this row serve; a blob failed alone goes to the next provider. Attempts per provider are bounded by twice the blobs. `start_get_many_on` runs on any stream pair. The provider's get-many reply and the receiver's request are synced, as the single get already was, so a stream transform (zstd) flushes them. The upstream `downloader_get_many_smoke` test, `#[ignore = "todo"]`, now runs. Tests: `downloader_get_many_uses_one_stream_per_provider` (one get-many request, no single gets, per-blob events in order), `downloader_get_many_fails_over_per_blob_in_provider_order`, `zstd_get_many_completes_every_blob` (per-blob payload and wire bytes sum to the stream's). Asked for by portal-sync (§P). |
 | 40 | none recorded (`48671037`) | `Options::meta_cache_size: Option<usize>` sets the metadata database's redb page cache (default `None`, redb's 1 GiB). A new public field: struct-literal `Options` construction must add it. Test: `test_meta_cache_size_store_round_trips`. Asked for by portal-sync (§O). |
+| 75 | none recorded (`832bccea`, `5ea93341`, `130c7429`) | The metadata actor group-commits durability waiters: a `SyncDb` joins the open write transaction instead of ending it, the actor drains only what is already queued once a waiter exists, commits, then answers every waiter (a lone writer still commits at once). Write transactions are timed by `max_write_duration` (it was never read; the loop used `max_read_duration`), and `max_write_batch` defaults to 10000 (was 1000). Files: `src/store/fs/meta.rs`, `src/store/fs/meta/proto.rs`, `src/store/fs/util.rs`, `src/store/fs/options.rs`. Tests: `queued_syncs_share_one_commit`, `lone_sync_does_not_wait_for_timer`, `batch_cap_splits_commits`, `test_sync_db_makes_writes_durable`, `test_concurrent_writers_sync_db`. | Bytes written per small blob under concurrent durable writers (portal-sync, aster-request §M(4)): 8 writers at batch 128 went from 10.6 to 9.1 KB/blob. | carried | A failed commit now answers every waiter with the error (before, sync callers saw a dropped channel). |
+| 76 | none recorded (`e7937c99`) | Schema `blobs-1`: one row per blob holding the postcard `EntryState<()>` header (byte-identical to `blobs-0` values) plus any inline data and inline outboard as a trailer; `inline-data-0` and `inline-outboard-0` are gone. `Actor::new` migrates a legacy store in resumable chunks (20,000 rows or 16 MiB per write transaction; each chunk inserts into `blobs-1` and removes the same keys from the three legacy tables; the last drops them). Files: `src/store/fs/meta/row.rs`, `src/store/fs/meta/migrate.rs`, `src/store/fs/meta.rs`, `src/store/fs/meta/tables.rs`, `src/store/fs/entry_state.rs`. | Each small-blob insert dirtied a random leaf in two hash-keyed tables; one row halves that: 256 B blobs write 39% fewer bytes (12.8 to 7.8 KB/blob), 8 KiB blobs 16% fewer. A 1M-blob store migrates in about 6 s. | carried | One-way: older code cannot open a migrated store. Porting: keep the legacy `Value` impl in `migrate.rs` while any store may still hold `blobs-0`. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -157,7 +159,15 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.103.2001 (2026-11-07), current
+### 0.103.2002 (2026-11-07), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.103.1` | `aster-iroh-blobs-v0.103.2002` | `e7937c995dd0b947234e5759a2a81d5609fa900e` | `upgrade/iroh-blobs-v0.103.1` |
+
+- **`aster-iroh-blobs-v0.103.2002`** (`e7937c99`): rows 75 (group commit, write batch cap and duration) and 76 (merged `blobs-1` row with a migration at open). `cargo test --all-features` 153 lib tests plus the integration suites pass; iroh-docs re-pins to it as `aster-iroh-docs-v0.101.1031-p2`.
+
+### 0.103.2001 (2026-11-07)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
