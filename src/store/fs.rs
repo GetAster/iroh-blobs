@@ -706,7 +706,13 @@ impl Actor {
         fs::create_dir_all(db_path.parent().unwrap())?;
         let (db_send, db_recv) = tokio::sync::mpsc::channel(100);
         let (protect, ds) = delete_set::pair(Arc::new(options.path.clone()));
-        let db_actor = meta::Actor::new(db_path, db_recv, ds, options.batch.clone())?;
+        let db_actor = meta::Actor::new(
+            db_path,
+            db_recv,
+            ds,
+            options.batch.clone(),
+            options.meta_cache_size,
+        )?;
         // We hold the database lock now, so no other store is importing into the temp
         // directory. Anything in it is left over from imports that did not complete,
         // for example because the process was killed.
@@ -1681,6 +1687,33 @@ pub mod tests {
         let ranges = round_up_request(data.len() as u64, ranges);
         let (hash, encoded) = create_n0_bao(data, &ranges)?;
         Ok((hash, ranges, encoded))
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_meta_cache_size_store_round_trips() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let db_dir = testdir.path().join("db");
+        let mut options = Options::new(&db_dir);
+        options.meta_cache_size = Some(64 * 1024);
+        let store = FsStore::load_with_opts(db_dir.join("blobs.db"), options.clone()).await?;
+        let mut hashes = Vec::new();
+        for i in 0..500u32 {
+            let tag = store.add_bytes(format!("blob {i}").repeat(16)).await?;
+            store
+                .tags()
+                .set(format!("t{i}"), tag.hash_and_format())
+                .await?;
+            hashes.push(tag.hash);
+        }
+        store.shutdown().await?;
+        let store = FsStore::load_with_opts(db_dir.join("blobs.db"), options).await?;
+        for (i, hash) in hashes.iter().enumerate() {
+            let bytes = store.get_bytes(*hash).await?;
+            assert_eq!(bytes, format!("blob {i}").repeat(16).as_bytes());
+        }
+        store.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

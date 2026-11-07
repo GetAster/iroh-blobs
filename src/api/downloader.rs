@@ -28,7 +28,8 @@ use tracing::instrument::Instrument;
 
 use super::Store;
 use crate::{
-    protocol::{GetManyRequest, GetRequest},
+    api::remote::GetManyEvent,
+    protocol::{ChunkRangesSeq, GetManyRequest, GetRequest},
     transport::{StreamTally, StreamTallySnapshot, StreamTransform, TransformedConnection},
     util::{
         connection_pool::{ConnectionPool, ConnectionRef, PoolConnectError},
@@ -273,8 +274,17 @@ async fn handle_download_impl(
                 )
                 .await?;
             }
-            FiniteRequest::GetMany(_) => {
-                handle_download_split_impl(store, pool, request, tx).await?
+            FiniteRequest::GetMany(get_many) => {
+                let sink = IrpcSenderRefSink(tx);
+                execute_get_many(
+                    &pool,
+                    get_many,
+                    &request.providers,
+                    &store,
+                    request.provider_idle_timeout,
+                    sink,
+                )
+                .await?;
             }
         },
     }
@@ -1077,6 +1087,322 @@ async fn execute_get(
     Err(anyerr!("Unable to download {}", request.hash))
 }
 
+/// Translates one get-many attempt's per-child events into the downloader's
+/// per-request progress items.
+///
+/// Every hash has one [`GetRequest`] for the whole download, so each child
+/// reports like a single-blob download: [`DownloadProgressItem::TryProvider`]
+/// when the provider starts sending it, then
+/// [`DownloadProgressItem::BytesTransferred`] and
+/// [`DownloadProgressItem::PartComplete`] once it is verified and stored. The
+/// stream's wire bytes are split at child boundaries, so per-child figures
+/// sum to the attempt's.
+struct GetManyAttemptSink<'a, S> {
+    progress: &'a mut S,
+    provider: EndpointId,
+    /// The request index of each child of this attempt's request.
+    children: &'a [usize],
+    requests: &'a [Arc<GetRequest>],
+    attempt: AttemptStats,
+    clock: Arc<StallClock>,
+    local_bytes: u64,
+    /// Payload read on the stream so far.
+    payload: u64,
+    /// The child being received: its request index, live counters, and the
+    /// stream's payload and wire bytes when it started.
+    current: Option<(usize, AttemptStats, u64, u64)>,
+    /// Request indices of the children this attempt stored.
+    served: Vec<usize>,
+}
+
+impl<S> GetManyAttemptSink<'_, S>
+where
+    S: Sink<DownloadProgressItem, Error = irpc::channel::SendError>,
+{
+    fn wire(&self) -> u64 {
+        self.attempt.wire_bytes().unwrap_or(0)
+    }
+
+    /// Bytes of the current child, and its request, once it ends.
+    fn take_current(&mut self) -> Option<(Arc<GetRequest>, u64, Option<u64>)> {
+        let (index, _, payload0, wire0) = self.current.take()?;
+        let wire = self.attempt.wire_bytes().map(|w| w - wire0);
+        Some((self.requests[index].clone(), self.payload - payload0, wire))
+    }
+
+    async fn send_bytes(
+        &mut self,
+        request: &Arc<GetRequest>,
+        bytes: u64,
+        wire_bytes: Option<u64>,
+    ) -> std::result::Result<(), irpc::channel::SendError> {
+        if bytes > 0 || wire_bytes.unwrap_or(0) > 0 {
+            self.progress
+                .send(DownloadProgressItem::BytesTransferred {
+                    id: self.provider,
+                    request: request.clone(),
+                    bytes,
+                    wire_bytes,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Report the child the stream failed on, if any. Returns its index.
+    async fn fail_current(
+        &mut self,
+    ) -> std::result::Result<Option<usize>, irpc::channel::SendError> {
+        let index = self.current.as_ref().map(|c| c.0);
+        if let Some((request, bytes, wire)) = self.take_current() {
+            self.send_bytes(&request, bytes, wire).await?;
+            self.progress
+                .send(DownloadProgressItem::ProviderFailed {
+                    id: self.provider,
+                    request,
+                })
+                .await?;
+        }
+        Ok(index)
+    }
+}
+
+impl<S> Sink<GetManyEvent> for GetManyAttemptSink<'_, S>
+where
+    S: Sink<DownloadProgressItem, Error = irpc::channel::SendError>,
+{
+    type Error = irpc::channel::SendError;
+
+    async fn send(&mut self, event: GetManyEvent) -> std::result::Result<(), Self::Error> {
+        match event {
+            GetManyEvent::Started(child) => {
+                let index = self.children[child];
+                let stats = AttemptStats::default();
+                self.current = Some((index, stats.clone(), self.payload, self.wire()));
+                self.progress
+                    .send(DownloadProgressItem::TryProvider {
+                        id: self.provider,
+                        request: self.requests[index].clone(),
+                        stats,
+                    })
+                    .await
+            }
+            GetManyEvent::Progress(payload) => {
+                self.payload = payload;
+                self.attempt.set_payload_bytes(payload);
+                if let Some((_, stats, payload0, _)) = &self.current {
+                    stats.set_payload_bytes(payload - payload0);
+                }
+                self.clock.touch();
+                self.progress
+                    .send(DownloadProgressItem::Progress(payload + self.local_bytes))
+                    .await
+            }
+            GetManyEvent::Finished(_) => {
+                let index = self.current.as_ref().map(|c| c.0);
+                if let Some((request, bytes, wire)) = self.take_current() {
+                    self.send_bytes(&request, bytes, wire).await?;
+                    self.progress
+                        .send(DownloadProgressItem::PartComplete { request })
+                        .await?;
+                    self.served.extend(index);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Download every blob of a get-many request over one stream per provider
+/// attempt, trying providers in order.
+///
+/// Each attempt asks the provider for what is still missing locally of every
+/// blob it has not yet answered for, in request order. A provider that lacks
+/// a blob resets the stream at it, which also discards blobs it sent that
+/// were not yet read, so the reset does not name the blob. The blobs stored
+/// before the reset count as answered and the rest are asked again; when
+/// nothing was stored, the next attempt asks for one blob only, and a
+/// single-blob attempt that fails leaves that blob to the next provider. A
+/// lost connection or failed dial moves on to the next provider. Every
+/// attempt either stores a blob, gives one up on this provider, or is a
+/// probe followed by one of those, so the attempts per provider are at most
+/// twice the number of blobs.
+///
+/// Providers are looked up once, for the first blob: the discovery is a
+/// provider list for the whole request, not per blob. Duplicate hashes are
+/// fetched once. Fails if any blob is still incomplete when every provider
+/// has been tried; the blobs that did arrive stay stored.
+async fn execute_get_many(
+    pool: &Dialer,
+    request: GetManyRequest,
+    providers: &Arc<dyn ContentDiscovery>,
+    store: &Store,
+    idle_timeout: Option<Duration>,
+    mut progress: impl Sink<DownloadProgressItem, Error = irpc::channel::SendError>,
+) -> Result<()> {
+    let remote = store.remote();
+    let mut seen = std::collections::HashSet::new();
+    let requests: Vec<Arc<GetRequest>> = request
+        .hashes
+        .iter()
+        .enumerate()
+        .filter(|(_, hash)| seen.insert(**hash))
+        .map(|(i, hash)| {
+            Arc::new(GetRequest::blob_ranges(
+                *hash,
+                request.ranges[i as u64].clone(),
+            ))
+        })
+        .collect();
+    let Some(first) = requests.first() else {
+        return Ok(());
+    };
+    let mut providers = providers.find_providers(HashAndFormat::raw(first.hash));
+    // A provider to try again on a fresh connection, and the last one retried.
+    let mut retry: Option<EndpointId> = None;
+    let mut retried: Option<EndpointId> = None;
+    // Request indices the current provider has answered for: served, or
+    // failed alone.
+    let mut failed_here = std::collections::HashSet::new();
+    // Ask the current provider for one blob only, after a failed attempt
+    // that stored nothing.
+    let mut probe = false;
+    'providers: loop {
+        let provider = match retry.take() {
+            Some(provider) => provider,
+            None => match providers.next().await {
+                Some(provider) => {
+                    failed_here.clear();
+                    probe = false;
+                    provider
+                }
+                None => break,
+            },
+        };
+        loop {
+            let mut children = Vec::new();
+            let mut ranges = Vec::new();
+            let mut local_bytes = 0;
+            let mut incomplete = false;
+            for (index, request) in requests.iter().enumerate() {
+                let local = remote.local_for_request(request.clone()).await?;
+                if local.is_complete() {
+                    continue;
+                }
+                incomplete = true;
+                if failed_here.contains(&index) {
+                    continue;
+                }
+                if probe && !children.is_empty() {
+                    continue;
+                }
+                local_bytes += local.local_bytes();
+                children.push(index);
+                ranges.push(local.missing().ranges[0].clone());
+            }
+            if !incomplete {
+                return Ok(());
+            }
+            if children.is_empty() {
+                continue 'providers;
+            }
+            let get_many = GetManyRequest::new(
+                children.iter().map(|&i| requests[i].hash).collect(),
+                ChunkRangesSeq::from_ranges(ranges),
+            );
+            let Ok(dialed) = pool.connect(provider).await else {
+                continue 'providers;
+            };
+            if let Some(cached) = dialed.fallback {
+                progress
+                    .send(DownloadProgressItem::PlainFallback {
+                        id: provider,
+                        cached,
+                    })
+                    .await?;
+            }
+            let conn: &iroh::endpoint::Connection = &dialed.conn;
+            let received = conn.stats().udp_rx.datagrams;
+            let clock = Arc::new(StallClock::new());
+            let attempt = AttemptStats::default();
+            let tally = dialed
+                .transform
+                .as_ref()
+                .map(|_| attempt.tally_for_transform());
+            let mut sink = GetManyAttemptSink {
+                progress: &mut progress,
+                provider,
+                children: &children,
+                requests: &requests,
+                attempt: attempt.clone(),
+                clock: clock.clone(),
+                local_bytes,
+                payload: 0,
+                current: None,
+                served: Vec::new(),
+            };
+            let outcome = match (&dialed.transform, tally) {
+                (Some(transform), Some(tally)) => {
+                    let get = remote.execute_get_many_children(
+                        TransformedConnection::new(conn.clone(), transform.clone())
+                            .with_tally(tally),
+                        get_many,
+                        &mut sink,
+                        Some(&clock),
+                    );
+                    guard_attempt(get, idle_timeout, &clock, conn, received).await
+                }
+                _ => {
+                    let get = remote.execute_get_many_children(
+                        conn.clone(),
+                        get_many,
+                        &mut sink,
+                        Some(&clock),
+                    );
+                    guard_attempt(get, idle_timeout, &clock, conn, received).await
+                }
+            };
+            let silent = matches!(outcome, Err(Abandoned::Silent));
+            // What this provider sent is all it has of a blob, so a blob it
+            // has answered for is not asked of it again. This bounds the
+            // attempts per provider even when it serves partial blobs.
+            if matches!(outcome, Ok(Ok(_))) {
+                failed_here.extend(children.iter().copied());
+                probe = false;
+                continue;
+            }
+            let served = sink.served.len();
+            failed_here.extend(sink.served.iter().copied());
+            sink.fail_current().await?;
+            let lost = connection_lost(conn) || silent;
+            if lost {
+                if idle_timeout.is_some() {
+                    tracing::debug!(%provider, silent, "connection to provider lost; retiring it");
+                    dialed.retire().await;
+                    if retried != Some(provider) {
+                        retried = Some(provider);
+                        retry = Some(provider);
+                    }
+                }
+                continue 'providers;
+            }
+            // The provider reset the stream: it lacks one of the blobs. A
+            // reset discards what was sent and not yet read, so it does not
+            // say which blob; only a single-blob attempt does.
+            if children.len() == 1 {
+                failed_here.insert(children[0]);
+                probe = false;
+            } else {
+                probe = served == 0;
+            }
+        }
+    }
+    Err(anyerr!(
+        "Unable to download every blob of a get-many request of {}",
+        requests.len()
+    ))
+}
+
 /// Why the stall guard abandoned a provider attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Abandoned {
@@ -1271,7 +1597,7 @@ impl ContentDiscovery for Shuffled {
 #[cfg(test)]
 #[cfg(feature = "fs-store")]
 mod tests {
-    use std::{collections::HashMap, ops::Deref};
+    use std::{collections::HashMap, ops::Deref, sync::Arc};
 
     use bao_tree::{ChunkNum, ChunkRanges};
     use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointId, RelayMode};
@@ -1293,8 +1619,179 @@ mod tests {
         Hash, HashAndFormat,
     };
 
+    /// Get and get-many requests a provider received.
+    type RequestCounts = Arc<std::sync::Mutex<(usize, usize)>>;
+
+    /// Counts the get and get-many requests a provider receives.
+    fn request_counter() -> (
+        crate::provider::events::EventSender,
+        RequestCounts,
+        n0_future::task::AbortOnDropHandle<()>,
+    ) {
+        use crate::provider::events::{EventMask, EventSender, ProviderMessage, RequestMode};
+        let counts = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
+        let mask = EventMask {
+            get: RequestMode::Notify,
+            get_many: RequestMode::Notify,
+            ..EventMask::DEFAULT
+        };
+        let (events, mut rx) = EventSender::channel(64, mask);
+        let task_counts = counts.clone();
+        let task = n0_future::task::AbortOnDropHandle::new(n0_future::task::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    ProviderMessage::GetRequestReceivedNotify(_) => {
+                        task_counts.lock().unwrap().0 += 1
+                    }
+                    ProviderMessage::GetManyRequestReceivedNotify(_) => {
+                        task_counts.lock().unwrap().1 += 1
+                    }
+                    _ => {}
+                }
+            }
+        }));
+        (events, counts, task)
+    }
+
+    fn small_blob(i: usize) -> Vec<u8> {
+        format!("blob {i:04} ").repeat(24).into_bytes()
+    }
+
+    fn whole(hashes: &[Hash]) -> GetManyRequest {
+        GetManyRequest::new(
+            hashes.to_vec(),
+            crate::protocol::ChunkRangesSeq::from_ranges(hashes.iter().map(|_| ChunkRanges::all())),
+        )
+    }
+
     #[tokio::test]
-    #[ignore = "todo"]
+    async fn downloader_get_many_uses_one_stream_per_provider() -> TestResult<()> {
+        use crate::tests::node_test_setup_with_events_mem;
+        let (events, counts, _task) = request_counter();
+        let (r1, store1, _) = node_test_setup_with_events_mem(events).await?;
+        let (r2, store2, sp2) = node_test_setup_mem().await?;
+        let mut hashes = Vec::new();
+        for i in 0..50 {
+            hashes.push(store1.add_bytes(small_blob(i)).await?.hash);
+        }
+        // A repeated hash is fetched once.
+        hashes.push(hashes[0]);
+        sp2.add_endpoint_info(r1.endpoint().addr());
+        let provider = r1.endpoint().id();
+        let items = Downloader::new(&store2, r2.endpoint())
+            .download(whole(&hashes), vec![provider])
+            .stream()
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+        for (i, hash) in hashes.iter().enumerate().take(50) {
+            assert_eq!(
+                store2.get_bytes(*hash).await?.deref(),
+                small_blob(i).as_slice()
+            );
+        }
+        assert_eq!(
+            *counts.lock().unwrap(),
+            (0, 1),
+            "one get-many request, no single gets"
+        );
+        let mut tried = Vec::new();
+        let mut completed = Vec::new();
+        for item in &items {
+            match item {
+                DownloadProgressItem::TryProvider { id, request, .. } => {
+                    assert_eq!(*id, provider);
+                    tried.push(request.hash);
+                }
+                DownloadProgressItem::PartComplete { request } => completed.push(request.hash),
+                DownloadProgressItem::ProviderFailed { .. } => panic!("no provider failed"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            tried,
+            hashes[..50],
+            "each blob is tried once, in request order"
+        );
+        assert_eq!(
+            completed,
+            hashes[..50],
+            "each blob completes once, in request order"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn downloader_get_many_fails_over_per_blob_in_provider_order() -> TestResult<()> {
+        use crate::tests::node_test_setup_with_events_mem;
+        let (events1, counts1, _task1) = request_counter();
+        let (events2, counts2, _task2) = request_counter();
+        let (r1, store1, _) = node_test_setup_with_events_mem(events1).await?;
+        let (r2, store2, _) = node_test_setup_with_events_mem(events2).await?;
+        let (r3, store3, sp3) = node_test_setup_mem().await?;
+        let mut hashes = Vec::new();
+        for i in 0..10 {
+            let hash = store2.add_bytes(small_blob(i)).await?.hash;
+            if i != 3 && i != 7 {
+                store1.add_bytes(small_blob(i)).await?;
+            }
+            hashes.push(hash);
+        }
+        sp3.add_endpoint_info(r1.endpoint().addr());
+        sp3.add_endpoint_info(r2.endpoint().addr());
+        let (p1, p2) = (r1.endpoint().id(), r2.endpoint().id());
+        let items = Downloader::new(&store3, r3.endpoint())
+            .download(whole(&hashes), vec![p1, p2])
+            .stream()
+            .await?
+            .collect::<Vec<_>>()
+            .await;
+        for (i, hash) in hashes.iter().enumerate() {
+            assert_eq!(
+                store3.get_bytes(*hash).await?.deref(),
+                small_blob(i).as_slice()
+            );
+        }
+        // How many blobs a reset discards depends on timing, so p1's count
+        // varies, within the bound of two attempts per blob. p2 is asked once,
+        // for exactly the two blobs p1 lacks.
+        let (gets1, get_manys1) = *counts1.lock().unwrap();
+        assert_eq!(gets1, 0);
+        assert!(
+            (3..=20).contains(&get_manys1),
+            "p1 got {get_manys1} get-many requests"
+        );
+        assert_eq!(*counts2.lock().unwrap(), (0, 1));
+        let mut served = HashMap::new();
+        let mut failed = Vec::new();
+        let mut current = HashMap::new();
+        for item in &items {
+            match item {
+                DownloadProgressItem::TryProvider { id, request, .. } => {
+                    current.insert(request.hash, *id);
+                }
+                DownloadProgressItem::ProviderFailed { id, request } => {
+                    failed.push((*id, request.hash));
+                }
+                DownloadProgressItem::PartComplete { request } => {
+                    served.insert(request.hash, current[&request.hash]);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            failed.iter().all(|(id, _)| *id == p1),
+            "only p1 fails: {failed:?}"
+        );
+        assert!(failed.contains(&(p1, hashes[3])) && failed.contains(&(p1, hashes[7])));
+        for (i, hash) in hashes.iter().enumerate() {
+            let expected = if i == 3 || i == 7 { p2 } else { p1 };
+            assert_eq!(served[hash], expected, "blob {i}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn downloader_get_many_smoke() -> TestResult<()> {
         let testdir = tempfile::tempdir()?;
         let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("a")).await?;

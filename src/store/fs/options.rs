@@ -112,6 +112,10 @@ pub struct Options {
     pub batch: BatchOptions,
     /// Gc configuration.
     pub gc: Option<GcConfig>,
+    /// Page cache size of the metadata database, in bytes. `None` keeps
+    /// redb's default (1 GiB). The cache grows up to this bound as pages are
+    /// read, so it bounds the store's resident memory for metadata.
+    pub meta_cache_size: Option<usize>,
 }
 
 impl Options {
@@ -122,6 +126,7 @@ impl Options {
             inline: InlineOptions::default(),
             batch: BatchOptions::default(),
             gc: None,
+            meta_cache_size: None,
         }
     }
 
