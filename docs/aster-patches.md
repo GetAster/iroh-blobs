@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.103.1` |
 | Integration branch | `upgrade/iroh-blobs-v0.103.1` (cut from `v0.103.1`; `upgrade/iroh-blobs-v0.103` is the historical per-minor line on `v0.103.0`) |
-| Tag | `aster-iroh-blobs-v0.103.14` |
-| Pinned commit | `750b04f36bccb27252c502f0a7de580114ef7ef9` |
-| Crate version | 0.103.14 (workspace spec `iroh-blobs = "0.103.14"`) |
+| Tag | `aster-iroh-blobs-v0.103.2001` |
+| Pinned commit | `d5116409d990f1b1a79be7c58c4d71d4d557fc96` |
+| Crate version | 0.103.2001 (workspace spec `iroh-blobs = "0.103.2001"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-blobs.git` |
 
 The fork's own `[patch.crates-io]` (row 5, re-pinned by `825b70e8`) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001) and iroh-util `b28211ec` (0.6.3-p7), all matching the manifest. Upstream `v0.103.1` requires iroh-util 0.6.0; `15d47bdb` raises the requirement to 0.6.3 for row 34.
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 5, re-pinned by `825b70e8`) pins iroh `9
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "750b04f36bccb27252c502f0a7de580114ef7ef9" }
+iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "d5116409d990f1b1a79be7c58c4d71d4d557fc96" }
 ```
 
 ## Patches
@@ -157,7 +157,15 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.103.14 (2026-11-07), current
+### 0.103.2001 (2026-11-07), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.103.1` | `aster-iroh-blobs-v0.103.2001` | `d5116409d990f1b1a79be7c58c4d71d4d557fc96` | `upgrade/iroh-blobs-v0.103.1` |
+
+- **`aster-iroh-blobs-v0.103.2001`** (`d5116409`): the code of 0.103.14, renumbered into the fork patch space (option E: upstream 0.103.1, our patch 1). 0.103.14 was never published: the Aster publish refused it as outside that space. Cargo.toml and Cargo.lock only; `cargo check` clean.
+
+### 0.103.14 (2026-11-07), never published
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
