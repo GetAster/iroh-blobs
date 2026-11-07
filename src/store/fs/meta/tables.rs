@@ -1,36 +1,32 @@
 //! Table definitions and accessors for the redb database.
 use redb::{ReadableTable, TableDefinition, TableError};
 
-use super::EntryState;
+use super::row::BlobRow;
 use crate::{api::Tag, store::fs::delete_set::FileTransaction, Hash, HashAndFormat};
 
-pub(super) const BLOBS_TABLE: TableDefinition<Hash, EntryState> = TableDefinition::new("blobs-0");
+/// Hash to entry state, with inline data and inline outboard embedded in the
+/// row. See [`super::row`] for the encoding.
+///
+/// A store that has this table can no longer be opened by code that only
+/// knows the legacy `blobs-0`, `inline-data-0` and `inline-outboard-0` tables.
+/// [`super::migrate`] converts a legacy store when it is opened.
+pub(super) const BLOBS_TABLE: TableDefinition<Hash, BlobRow> = TableDefinition::new("blobs-1");
 
 pub(super) const TAGS_TABLE: TableDefinition<Tag, HashAndFormat> = TableDefinition::new("tags-0");
-
-pub(super) const INLINE_DATA_TABLE: TableDefinition<Hash, &[u8]> =
-    TableDefinition::new("inline-data-0");
-
-pub(super) const INLINE_OUTBOARD_TABLE: TableDefinition<Hash, &[u8]> =
-    TableDefinition::new("inline-outboard-0");
 
 /// A trait similar to [`redb::ReadableTable`] but for all tables that make up
 /// the blob store. This can be used in places where either a readonly or
 /// mutable table is needed.
 pub(super) trait ReadableTables {
-    fn blobs(&self) -> &impl ReadableTable<Hash, EntryState>;
+    fn blobs(&self) -> &impl ReadableTable<Hash, BlobRow>;
     fn tags(&self) -> &impl ReadableTable<Tag, HashAndFormat>;
-    fn inline_data(&self) -> &impl ReadableTable<Hash, &'static [u8]>;
-    fn inline_outboard(&self) -> &impl ReadableTable<Hash, &'static [u8]>;
 }
 
 /// A struct similar to [`redb::Table`] but for all tables that make up the
 /// blob store.
 pub(super) struct Tables<'a> {
-    pub blobs: redb::Table<'a, Hash, EntryState>,
+    pub blobs: redb::Table<'a, Hash, BlobRow>,
     pub tags: redb::Table<'a, Tag, HashAndFormat>,
-    pub inline_data: redb::Table<'a, Hash, &'static [u8]>,
-    pub inline_outboard: redb::Table<'a, Hash, &'static [u8]>,
     pub ftx: &'a FileTransaction<'a>,
 }
 
@@ -42,25 +38,17 @@ impl<'txn> Tables<'txn> {
         Ok(Self {
             blobs: tx.open_table(BLOBS_TABLE)?,
             tags: tx.open_table(TAGS_TABLE)?,
-            inline_data: tx.open_table(INLINE_DATA_TABLE)?,
-            inline_outboard: tx.open_table(INLINE_OUTBOARD_TABLE)?,
             ftx: ds,
         })
     }
 }
 
 impl ReadableTables for Tables<'_> {
-    fn blobs(&self) -> &impl ReadableTable<Hash, EntryState> {
+    fn blobs(&self) -> &impl ReadableTable<Hash, BlobRow> {
         &self.blobs
     }
     fn tags(&self) -> &impl ReadableTable<Tag, HashAndFormat> {
         &self.tags
-    }
-    fn inline_data(&self) -> &impl ReadableTable<Hash, &'static [u8]> {
-        &self.inline_data
-    }
-    fn inline_outboard(&self) -> &impl ReadableTable<Hash, &'static [u8]> {
-        &self.inline_outboard
     }
 }
 
@@ -68,10 +56,8 @@ impl ReadableTables for Tables<'_> {
 /// the blob store.
 #[derive(Debug)]
 pub(crate) struct ReadOnlyTables {
-    pub blobs: redb::ReadOnlyTable<Hash, EntryState>,
+    pub blobs: redb::ReadOnlyTable<Hash, BlobRow>,
     pub tags: redb::ReadOnlyTable<Tag, HashAndFormat>,
-    pub inline_data: redb::ReadOnlyTable<Hash, &'static [u8]>,
-    pub inline_outboard: redb::ReadOnlyTable<Hash, &'static [u8]>,
 }
 
 impl ReadOnlyTables {
@@ -79,23 +65,15 @@ impl ReadOnlyTables {
         Ok(Self {
             blobs: tx.open_table(BLOBS_TABLE)?,
             tags: tx.open_table(TAGS_TABLE)?,
-            inline_data: tx.open_table(INLINE_DATA_TABLE)?,
-            inline_outboard: tx.open_table(INLINE_OUTBOARD_TABLE)?,
         })
     }
 }
 
 impl ReadableTables for ReadOnlyTables {
-    fn blobs(&self) -> &impl ReadableTable<Hash, EntryState> {
+    fn blobs(&self) -> &impl ReadableTable<Hash, BlobRow> {
         &self.blobs
     }
     fn tags(&self) -> &impl ReadableTable<Tag, HashAndFormat> {
         &self.tags
-    }
-    fn inline_data(&self) -> &impl ReadableTable<Hash, &'static [u8]> {
-        &self.inline_data
-    }
-    fn inline_outboard(&self) -> &impl ReadableTable<Hash, &'static [u8]> {
-        &self.inline_outboard
     }
 }
