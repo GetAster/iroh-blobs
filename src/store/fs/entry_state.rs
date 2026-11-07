@@ -1,7 +1,6 @@
 use std::{fmt::Debug, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 
 use super::meta::{ActorError, ActorResult};
 use crate::store::util::SliceInfoExt;
@@ -14,7 +13,7 @@ use crate::store::util::SliceInfoExt;
 /// Only complete data can be inlined.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DataLocation<I = (), E = ()> {
-    /// Data is in the inline_data table.
+    /// Data is embedded in the entry row (`blobs-1`).
     Inline(I),
     /// Data is in the canonical location in the data directory.
     Owned(E),
@@ -106,7 +105,7 @@ impl<I, E> DataLocation<I, E> {
 /// Only complete outboards can be inlined.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OutboardLocation<I = ()> {
-    /// Outboard is in the inline_outboard table.
+    /// Outboard is embedded in the entry row (`blobs-1`).
     Inline(I),
     /// Outboard is in the canonical location in the data directory.
     Owned,
@@ -214,7 +213,7 @@ impl<I: AsRef<[u8]>> EntryState<I> {
     }
 }
 
-impl EntryState {
+impl<I> EntryState<I> {
     #[allow(clippy::result_large_err)]
     pub fn union(old: Self, new: Self) -> ActorResult<Self> {
         match (old, new) {
@@ -264,34 +263,5 @@ impl EntryState {
                 Ok(Self::Partial { size })
             }
         }
-    }
-}
-
-impl redb::Value for EntryState {
-    type SelfType<'a> = EntryState;
-
-    type AsBytes<'a> = SmallVec<[u8; 128]>;
-
-    fn fixed_width() -> Option<usize> {
-        None
-    }
-
-    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
-    where
-        Self: 'a,
-    {
-        postcard::from_bytes(data).unwrap()
-    }
-
-    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
-    where
-        Self: 'a,
-        Self: 'b,
-    {
-        postcard::to_extend(value, SmallVec::new()).unwrap()
-    }
-
-    fn type_name() -> redb::TypeName {
-        redb::TypeName::new("EntryState")
     }
 }

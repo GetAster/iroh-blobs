@@ -17,7 +17,7 @@ use bytes::Bytes;
 use n0_error::StdResultExt;
 use redb::ReadableTable;
 
-use super::{tables::Tables, ActorError};
+use super::{row::to_owned_state, tables::Tables, ActorError};
 use crate::{
     store::{
         fs::{
@@ -50,7 +50,7 @@ pub(super) fn recover(
     let mut entries = Vec::new();
     for item in tables.blobs.iter()? {
         let (hash, state) = item?;
-        entries.push((hash.value(), state.value()));
+        entries.push((hash.value(), to_owned_state(state.value())));
     }
     let mut res = Recovered::default();
     for (hash, state) in entries {
@@ -60,8 +60,8 @@ pub(super) fn recover(
                 res.partial += 1;
             }
             EntryState::Complete {
-                data_location: DataLocation::Inline(()),
-                outboard_location: OutboardLocation::Inline(()) | OutboardLocation::NotNeeded,
+                data_location: DataLocation::Inline(_),
+                outboard_location: OutboardLocation::Inline(_) | OutboardLocation::NotNeeded,
             } => {}
             EntryState::Complete {
                 data_location: DataLocation::External(..),
@@ -72,7 +72,7 @@ pub(super) fn recover(
                 outboard_location,
             } => {
                 let size = match &data_location {
-                    DataLocation::Inline(()) => inline(&tables.inline_data, &hash)?.len() as u64,
+                    DataLocation::Inline(data) => data.len() as u64,
                     DataLocation::Owned(size) | DataLocation::External(_, size) => *size,
                 };
                 make_partial(
@@ -100,15 +100,13 @@ fn make_partial(
     paths: &PathOptions,
     hash: &Hash,
     size: u64,
-    data_location: &DataLocation<(), u64>,
-    outboard_location: &OutboardLocation,
+    data_location: &DataLocation<Bytes, u64>,
+    outboard_location: &OutboardLocation<Bytes>,
 ) -> Result<(), ActorError> {
-    if let DataLocation::Inline(()) = data_location {
-        let data = inline(&tables.inline_data, hash)?;
+    if let DataLocation::Inline(data) = data_location {
         fs::write(paths.data_path(hash), data).std_context("writing data")?;
     }
-    if let OutboardLocation::Inline(()) = outboard_location {
-        let outboard = inline(&tables.inline_outboard, hash)?;
+    if let OutboardLocation::Inline(outboard) = outboard_location {
         fs::write(paths.outboard_path(hash), outboard).std_context("writing outboard")?;
     }
     // the size goes in the slot of the last chunk group
@@ -117,26 +115,10 @@ fn make_partial(
         .write_all_at(size_slot(size.saturating_sub(1)), &size.to_le_bytes())
         .std_context("writing sizes")?;
     remove_if_exists(&paths.bitfield_path(hash)).std_context("removing a bitfield")?;
-    tables.inline_data.remove(hash)?;
-    tables.inline_outboard.remove(hash)?;
     tables
         .blobs
         .insert(hash, EntryState::Partial { size: Some(size) })?;
     Ok(())
-}
-
-/// Reads the inline data or outboard of `hash` from `table`.
-fn inline(
-    table: &impl ReadableTable<Hash, &'static [u8]>,
-    hash: &Hash,
-) -> Result<Bytes, ActorError> {
-    match table.get(hash)? {
-        Some(data) => Ok(Bytes::copy_from_slice(data.value())),
-        None => Err(ActorError::inconsistent(format!(
-            "inline part missing for {}",
-            hash.to_hex()
-        ))),
-    }
 }
 
 fn remove_if_exists(path: &Path) -> io::Result<()> {
