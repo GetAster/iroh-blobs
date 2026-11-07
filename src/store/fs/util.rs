@@ -50,6 +50,22 @@ impl<T> PeekableReceiver<T> {
         }
     }
 
+    /// Like [Self::extract], but never waits: returns None if no message is
+    /// queued right now or the queued one does not pass the filter.
+    pub fn try_extract<U>(&mut self, f: impl Fn(T) -> std::result::Result<U, T>) -> Option<U> {
+        let msg = match self.msg.take() {
+            Some(msg) => msg,
+            None => self.recv.try_recv().ok()?,
+        };
+        match f(msg) {
+            Ok(u) => Some(u),
+            Err(msg) => {
+                self.msg = Some(msg);
+                None
+            }
+        }
+    }
+
     /// Push back a message. This will only work if there is room for it.
     /// Otherwise, it will fail and return the message.
     pub fn push_back(&mut self, msg: T) -> std::result::Result<(), T> {

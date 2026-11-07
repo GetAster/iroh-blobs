@@ -210,12 +210,32 @@ impl Command {
         }
     }
 
+    /// Commands that can join an open write transaction: everything except
+    /// the top level commands, and `SyncDb`, which waits for the commit.
+    pub fn write_batch_member(self) -> std::result::Result<WriteBatchMember, Self> {
+        match self {
+            Self::ReadOnly(cmd) => Ok(WriteBatchMember::Command(NonTopLevelCommand::ReadOnly(cmd))),
+            Self::ReadWrite(cmd) => Ok(WriteBatchMember::Command(NonTopLevelCommand::ReadWrite(
+                cmd,
+            ))),
+            Self::TopLevel(TopLevelCommand::SyncDb(cmd)) => Ok(WriteBatchMember::Sync(cmd)),
+            _ => Err(self),
+        }
+    }
+
     pub fn read_only(self) -> std::result::Result<ReadOnlyCommand, Self> {
         match self {
             Self::ReadOnly(cmd) => Ok(cmd),
             _ => Err(self),
         }
     }
+}
+
+/// What a write transaction accepts, see [Command::write_batch_member].
+#[derive(Debug)]
+pub enum WriteBatchMember {
+    Command(NonTopLevelCommand),
+    Sync(SyncDbMsg),
 }
 
 #[derive(Debug)]

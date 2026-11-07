@@ -638,6 +638,9 @@ pub struct Actor {
     ds: DeleteHandle,
     options: BatchOptions,
     protection: Protection,
+    /// Number of committed write transactions.
+    #[cfg(test)]
+    pub(crate) commits: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Actor {
@@ -676,6 +679,8 @@ impl Actor {
             ds,
             options,
             protection: Default::default(),
+            #[cfg(test)]
+            commits: Default::default(),
         })
     }
 
@@ -1003,24 +1008,79 @@ impl Actor {
                         .map_err(|e| e!(ActorError::Transaction, e))?;
                     let mut tables =
                         Tables::new(&tx, &ftx).map_err(|e| e!(ActorError::Table, e))?;
-                    let timeout = n0_future::time::sleep(self.options.max_write_duration);
+                    let deadline =
+                        n0_future::time::Instant::now() + self.options.max_write_duration;
+                    let timeout = n0_future::time::sleep_until(deadline);
                     pin!(timeout);
                     let mut n = 0;
-                    while let Some(cmd) = self
-                        .cmds
-                        .extract(Command::non_top_level, &mut timeout)
-                        .await
-                    {
-                        Self::handle_non_toplevel(&mut self.protection, &mut tables, cmd, op)
-                            .await?;
-                        n += 1;
-                        if n >= options.max_write_batch {
-                            break;
+                    // `SyncDb` waiters collected in this transaction. Each is
+                    // answered only after the commit that covers every write
+                    // queued before it.
+                    let mut waiters: Vec<SyncDbMsg> = Vec::new();
+                    let res = async {
+                        loop {
+                            let member = if waiters.is_empty() {
+                                // Wait for more work until the batch is full or
+                                // the timer fires.
+                                self.cmds
+                                    .extract(Command::write_batch_member, &mut timeout)
+                                    .await
+                            } else {
+                                // Someone is waiting for durability: take what
+                                // is already queued, but never wait for more,
+                                // so a lone writer commits right away.
+                                if n0_future::time::Instant::now() >= deadline {
+                                    break;
+                                }
+                                self.cmds.try_extract(Command::write_batch_member)
+                            };
+                            match member {
+                                Some(WriteBatchMember::Command(cmd)) => {
+                                    Self::handle_non_toplevel(
+                                        &mut self.protection,
+                                        &mut tables,
+                                        cmd,
+                                        op,
+                                    )
+                                    .await?;
+                                }
+                                Some(WriteBatchMember::Sync(cmd)) => {
+                                    trace!("{cmd:?}");
+                                    waiters.push(cmd);
+                                }
+                                None => break,
+                            }
+                            n += 1;
+                            if n >= options.max_write_batch {
+                                break;
+                            }
+                        }
+                        ActorResult::Ok(())
+                    }
+                    .await;
+                    drop(tables);
+                    let res = res.and_then(|()| {
+                        tx.commit().map_err(|e| e!(ActorError::Commit, e))?;
+                        ftx.commit();
+                        #[cfg(test)]
+                        self.commits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Ok(())
+                    });
+                    match res {
+                        Ok(()) => {
+                            for SyncDbMsg { tx, .. } in waiters {
+                                tx.send(Ok(())).await.ok();
+                            }
+                        }
+                        Err(err) => {
+                            for SyncDbMsg { tx, .. } in waiters {
+                                let err = api::Error::Io(io::Error::other(err.to_string()));
+                                tx.send(Err(err)).await.ok();
+                            }
+                            return Err(err);
                         }
                     }
-                    drop(tables);
-                    tx.commit().map_err(|e| e!(ActorError::Commit, e))?;
-                    ftx.commit();
                 }
             }
         };
@@ -1154,7 +1214,10 @@ async fn list_blobs_impl(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::{atomic::Ordering, Arc},
+        time::Duration,
+    };
 
     use super::{
         super::{delete_set, options::PathOptions},
@@ -1229,5 +1292,132 @@ mod tests {
             "committed metadata still refers to this file"
         );
         Ok(())
+    }
+
+    fn inline_state(data: &[u8]) -> EntryState<Bytes> {
+        EntryState::Complete {
+            data_location: DataLocation::Inline(Bytes::copy_from_slice(data)),
+            outboard_location: OutboardLocation::NotNeeded,
+        }
+    }
+
+    fn set_msg(i: u32) -> (Command, oneshot::Receiver<ActorResult<()>>) {
+        let data = i.to_be_bytes();
+        let (tx, rx) = oneshot::channel();
+        let cmd = Set {
+            hash: Hash::new(data),
+            state: inline_state(&data),
+            tx,
+            span: Span::none(),
+        };
+        (cmd.into(), rx)
+    }
+
+    fn sync_msg() -> (Command, irpc::channel::oneshot::Receiver<api::Result<()>>) {
+        let (tx, rx) = irpc::channel::oneshot::channel();
+        let msg = SyncDbMsg {
+            inner: crate::api::proto::SyncDbRequest,
+            tx,
+            rx: irpc::channel::none::NoReceiver,
+            span: Span::none(),
+        };
+        (TopLevelCommand::SyncDb(msg).into(), rx)
+    }
+
+    fn actor(
+        dir: &std::path::Path,
+        options: BatchOptions,
+    ) -> (Actor, tokio::sync::mpsc::Sender<Command>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(1000);
+        let (_protect, ds) = delete_set::pair(Arc::new(PathOptions::new(dir)));
+        let actor = Actor::new(dir.join("meta.redb"), rx, ds, options, None).unwrap();
+        (actor, tx)
+    }
+
+    /// Everything queued before the actor starts, writes interleaved with
+    /// syncs, ends up in a single commit, and every sync is answered after it.
+    #[tokio::test]
+    async fn queued_syncs_share_one_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (actor, tx) = actor(dir.path(), BatchOptions::default());
+        let commits = actor.commits.clone();
+        let mut sets = Vec::new();
+        let mut syncs = Vec::new();
+        for i in 0..40 {
+            let (cmd, rx) = set_msg(i);
+            tx.send(cmd).await.unwrap();
+            sets.push(rx);
+            if i % 8 == 7 {
+                let (cmd, rx) = sync_msg();
+                tx.send(cmd).await.unwrap();
+                syncs.push(rx);
+            }
+        }
+        let task = tokio::spawn(actor.run());
+        for rx in syncs {
+            rx.await.unwrap().unwrap();
+            // The reply is only sent after the commit.
+            assert_eq!(commits.load(Ordering::Relaxed), 1);
+        }
+        for rx in sets {
+            rx.await.unwrap().unwrap();
+        }
+        drop(tx);
+        task.await.unwrap();
+        assert_eq!(commits.load(Ordering::Relaxed), 1);
+    }
+
+    /// A lone write followed by a sync commits as soon as the queue is empty,
+    /// without waiting for the duration timer.
+    #[tokio::test]
+    async fn lone_sync_does_not_wait_for_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = BatchOptions {
+            max_write_duration: Duration::from_secs(60),
+            max_read_duration: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let (actor, tx) = actor(dir.path(), options);
+        let commits = actor.commits.clone();
+        let task = tokio::spawn(actor.run());
+        for i in 0..3 {
+            let (cmd, rx) = set_msg(i);
+            tx.send(cmd).await.unwrap();
+            rx.await.unwrap().unwrap();
+            let (cmd, rx) = sync_msg();
+            tx.send(cmd).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), rx)
+                .await
+                .expect("sync waited for the timer")
+                .unwrap()
+                .unwrap();
+            assert_eq!(commits.load(Ordering::Relaxed), i as u64 + 1);
+        }
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    /// The batch size cap still splits a long queue into several commits, and
+    /// a sync is answered by the commit that covers it.
+    #[tokio::test]
+    async fn batch_cap_splits_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = BatchOptions {
+            max_write_batch: 10,
+            ..Default::default()
+        };
+        let (actor, tx) = actor(dir.path(), options);
+        let commits = actor.commits.clone();
+        for i in 0..25 {
+            let (cmd, _rx) = set_msg(i);
+            tx.send(cmd).await.unwrap();
+        }
+        let (cmd, rx) = sync_msg();
+        tx.send(cmd).await.unwrap();
+        let task = tokio::spawn(actor.run());
+        rx.await.unwrap().unwrap();
+        assert_eq!(commits.load(Ordering::Relaxed), 3);
+        drop(tx);
+        task.await.unwrap();
     }
 }
