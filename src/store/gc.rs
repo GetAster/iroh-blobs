@@ -525,8 +525,14 @@ mod tests {
         // fresh mark's snapshot) …
         let mut live2 = HashSet::new();
         gc_run_once(store, &mut live2).await?;
-        assert_eq!(store.get_bytes(guarded).await?.as_ref(), guarded_data.as_slice());
-        assert_eq!(store.get_bytes(tagged).await?.as_ref(), tagged_data.as_slice());
+        assert_eq!(
+            store.get_bytes(guarded).await?.as_ref(),
+            guarded_data.as_slice()
+        );
+        assert_eq!(
+            store.get_bytes(tagged).await?.as_ref(),
+            tagged_data.as_slice()
+        );
 
         // … and deleting them makes both reclaimable: protection joined the
         // sweep, it did not leak past the tags' lifetimes.

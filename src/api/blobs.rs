@@ -46,11 +46,10 @@ pub use super::proto::{
 };
 use super::{
     proto::{
-        BatchResponse, BlobBytesRequest, BlobStatusManyRequest, BlobStatusRequest,
-        AddProtectedRequest, ClearProtectedRequest, CreateTempTagRequest, ExportBaoRequest,
-        ExportRangesItem,
-        ImportBaoRequest, ImportByteStreamRequest, ImportBytesRequest, ImportPathRequest,
-        ListRequest, Scope,
+        AddProtectedRequest, BatchResponse, BlobBytesRequest, BlobStatusManyRequest,
+        BlobStatusRequest, ClearProtectedRequest, CreateTempTagRequest, ExportBaoRequest,
+        ExportRangesItem, ImportBaoRequest, ImportByteStreamRequest, ImportBytesRequest,
+        ImportPathRequest, ListRequest, Scope,
     },
     remote::HashSeqChunk,
     tags::TagInfo,

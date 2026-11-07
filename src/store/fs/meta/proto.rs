@@ -9,8 +9,7 @@ use super::{ActorResult, ReadOnlyTables};
 use crate::{
     api::proto::{
         AddProtectedMsg, BlobStatusManyMsg, BlobStatusMsg, ClearProtectedMsg, DeleteBlobsMsg,
-        ProcessExitRequest,
-        ShutdownMsg, SyncDbMsg,
+        ProcessExitRequest, ShutdownMsg, SyncDbMsg,
     },
     store::{fs::entry_state::EntryState, util::DD},
     util::channel::oneshot,
