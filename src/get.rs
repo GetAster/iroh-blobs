@@ -168,6 +168,13 @@ pub mod fsm {
             .send_bytes(request_bytes.into())
             .await
             .map_err(|source| e!(ConnectedNextError::Write, source))?;
+        // A transformed writer buffers until synced; finish writing before
+        // expecting a response.
+        writer
+            .sync()
+            .await
+            .map_err(|source| e!(ConnectedNextError::Write, source))?;
+        drop(writer);
         let Request::GetMany(request) = request else {
             unreachable!();
         };

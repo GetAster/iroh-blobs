@@ -850,6 +850,45 @@ mod tests {
         Ok(())
     }
 
+    /// A get-many request runs over one zstd stream: every blob arrives and
+    /// completes once, and the per-blob payload and wire bytes sum to the
+    /// stream's.
+    #[tokio::test]
+    async fn zstd_get_many_completes_every_blob() -> TestResult<()> {
+        let (holder, _) = zstd_node().await?;
+        let consumer = node(None).await?;
+        consumer.knows(&holder);
+        let mut hashes = Vec::new();
+        for i in 0..30 {
+            let blob = format!("zstd blob {i:03} ").repeat(30);
+            hashes.push(holder.store.add_slice(blob.as_bytes()).await?.hash);
+        }
+        let client = ZstdTransform::default();
+        let d = zstd_downloader(&consumer, &client, false);
+        let request = crate::protocol::GetManyRequest::new(
+            hashes.clone(),
+            crate::protocol::ChunkRangesSeq::from_ranges(
+                hashes.iter().map(|_| bao_tree::ChunkRanges::all()),
+            ),
+        );
+        let r = fetch(&d, request, vec![holder.id()], None).await?;
+        assert_eq!(r.errors, 0, "{r:?}");
+        assert!(r.failed.is_empty(), "{r:?}");
+        assert_eq!(r.completed, hashes.len());
+        for (i, hash) in hashes.iter().enumerate() {
+            let blob = format!("zstd blob {i:03} ").repeat(30);
+            assert_eq!(
+                consumer.store.get_bytes(*hash).await?.deref(),
+                blob.as_bytes()
+            );
+        }
+        let rx = client.stats().snapshot();
+        let (payload, wire) = r.by_provider[&holder.id()];
+        assert_eq!(payload, r.bytes);
+        assert_eq!(wire, Some(rx.wire_bytes_read), "{r:?}");
+        Ok(())
+    }
+
     /// A partially stored blob resumes over zstd and fetches only what is missing.
     #[tokio::test]
     async fn zstd_resumes_a_partial_blob() -> TestResult<()> {

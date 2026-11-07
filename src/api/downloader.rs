@@ -1221,12 +1221,13 @@ where
 /// a blob resets the stream at it, which also discards blobs it sent that
 /// were not yet read, so the reset does not name the blob. The blobs stored
 /// before the reset count as answered and the rest are asked again; when
-/// nothing was stored, the next attempt asks for one blob only, and a
-/// single-blob attempt that fails leaves that blob to the next provider. A
-/// lost connection or failed dial moves on to the next provider. Every
-/// attempt either stores a blob, gives one up on this provider, or is a
-/// probe followed by one of those, so the attempts per provider are at most
-/// twice the number of blobs.
+/// nothing was stored, the next attempt asks for the first blob alone over a
+/// plain get request, whose failure names that blob and which providers
+/// without get-many over a stream transform also serve. A blob that fails
+/// alone is left to the next provider. A lost connection or failed dial
+/// moves on to the next provider. Every attempt stores a blob, gives one up
+/// on this provider, or is followed by a probe that does, so the attempts per
+/// provider are at most twice the number of blobs.
 ///
 /// Providers are looked up once, for the first blob: the discovery is a
 /// provider list for the whole request, not per blob. Duplicate hashes are
@@ -1293,9 +1294,6 @@ async fn execute_get_many(
                 if failed_here.contains(&index) {
                     continue;
                 }
-                if probe && !children.is_empty() {
-                    continue;
-                }
                 local_bytes += local.local_bytes();
                 children.push(index);
                 ranges.push(local.missing().ranges[0].clone());
@@ -1305,6 +1303,28 @@ async fn execute_get_many(
             }
             if children.is_empty() {
                 continue 'providers;
+            }
+            if probe {
+                // One blob over a plain get request: the reply names the
+                // failure, and providers that predate get-many over a stream
+                // transform still serve it.
+                probe = false;
+                let index = children[0];
+                let single: Arc<dyn ContentDiscovery> = Arc::new(vec![provider]);
+                let result = execute_get(
+                    pool,
+                    requests[index].clone(),
+                    &single,
+                    store,
+                    idle_timeout,
+                    &mut progress,
+                )
+                .await;
+                // Answered either way. A provider that is gone fails the next
+                // attempt's dial and is left then.
+                drop(result);
+                failed_here.insert(index);
+                continue;
             }
             let get_many = GetManyRequest::new(
                 children.iter().map(|&i| requests[i].hash).collect(),
@@ -1753,13 +1773,12 @@ mod tests {
             );
         }
         // How many blobs a reset discards depends on timing, so p1's count
-        // varies, within the bound of two attempts per blob. p2 is asked once,
-        // for exactly the two blobs p1 lacks.
+        // varies, within the bound of two attempts per blob; probes are plain
+        // gets. p2 is asked once, for exactly the two blobs p1 lacks.
         let (gets1, get_manys1) = *counts1.lock().unwrap();
-        assert_eq!(gets1, 0);
         assert!(
-            (3..=20).contains(&get_manys1),
-            "p1 got {get_manys1} get-many requests"
+            get_manys1 >= 1 && gets1 + get_manys1 <= 20,
+            "p1: {gets1} gets, {get_manys1} get-manys"
         );
         assert_eq!(*counts2.lock().unwrap(), (0, 1));
         let mut served = HashMap::new();
