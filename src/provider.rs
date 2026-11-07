@@ -610,6 +610,12 @@ async fn handle_get_many_impl<W: SendStream>(
             send_blob(&store, child as u64, *hash, ranges.clone(), writer).await?;
         }
     }
+    // A transformed writer buffers until synced, as in `handle_get_impl`.
+    writer
+        .inner
+        .sync()
+        .await
+        .map_err(|e| e!(HandleGetManyError::ExportBao, e.into()))?;
     Ok(())
 }
 
