@@ -56,6 +56,9 @@ enum Cmd {
         #[clap(long)]
         source_only: bool,
     },
+    /// Open the `source` store under `--dir` and time it. With a store made
+    /// by the legacy layout this times the migration.
+    Open,
     /// Raw redb in the given key layout.
     Redb {
         #[clap(long, value_enum)]
@@ -283,8 +286,16 @@ fn run_redb(args: &Args, layout: Layout) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if matches!(args.cmd, Cmd::Open) {
+        let start = Instant::now();
+        let store = open_store(&args.dir.join("source"), &args).await?;
+        println!("open: {:?}", start.elapsed());
+        store.shutdown().await?;
+        return Ok(());
+    }
     anyhow::ensure!(!args.dir.exists(), "{} exists", args.dir.display());
     match args.cmd {
+        Cmd::Open => unreachable!(),
         Cmd::Store { source_only } => run_store(&args, source_only).await,
         Cmd::Redb { layout } => run_redb(&args, layout),
     }
