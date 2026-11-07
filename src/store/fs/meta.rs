@@ -20,9 +20,8 @@ use crate::{
         self,
         blobs::{BlobBytesResult, BlobStatus},
         proto::{
-            BlobBytesMsg, BlobBytesRequest, BlobDeleteRequest, BlobStatusManyMsg,
-            AddProtectedMsg, BlobStatusManyRequest, BlobStatusMsg, BlobStatusRequest,
-            ClearProtectedMsg,
+            AddProtectedMsg, BlobBytesMsg, BlobBytesRequest, BlobDeleteRequest, BlobStatusManyMsg,
+            BlobStatusManyRequest, BlobStatusMsg, BlobStatusRequest, ClearProtectedMsg,
             CreateTagRequest, DeleteBlobsMsg, DeleteTagsRequest, ListBlobsMsg, ListRequest,
             ListTagsRequest, RenameTagRequest, SetTagRequest, ShutdownMsg, SyncDbMsg,
         },
@@ -298,7 +297,9 @@ async fn handle_add_protected(
     protection: &mut Protection,
 ) -> ActorResult<()> {
     trace!("{cmd:?}");
-    protection.protected.extend(cmd.inner.hashes.iter().copied());
+    protection
+        .protected
+        .extend(cmd.inner.hashes.iter().copied());
     if cmd.inner.poison_sweep {
         // The claim cannot be expanded, so an in-flight sweep might delete
         // members of the claimed collection nobody can enumerate. Stop it
@@ -482,11 +483,7 @@ async fn handle_list_tags(msg: ListTagsMsg, tables: &impl ReadableTables) -> Act
     Ok(())
 }
 
-fn handle_update(
-    cmd: Update,
-    protection: &mut Protection,
-    tables: &mut Tables,
-) -> ActorResult<()> {
+fn handle_update(cmd: Update, protection: &mut Protection, tables: &mut Tables) -> ActorResult<()> {
     trace!("{cmd:?}");
     let Update {
         hash, state, tx, ..
@@ -623,9 +620,14 @@ impl Actor {
         cmds: tokio::sync::mpsc::Receiver<Command>,
         mut ds: DeleteHandle,
         options: BatchOptions,
+        cache_size: Option<usize>,
     ) -> Result<Self, ActorError> {
         debug!("creating or opening meta database at {}", db_path.display());
-        let db = match redb::Database::create(db_path) {
+        let mut builder = redb::Database::builder();
+        if let Some(cache_size) = cache_size {
+            builder.set_cache_size(cache_size);
+        }
+        let db = match builder.create(db_path) {
             Ok(db) => db,
             Err(DatabaseError::UpgradeRequired(v)) => {
                 return Err(anyerr!(

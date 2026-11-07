@@ -598,6 +598,7 @@ mod tests {
             batch: Default::default(),
             path: PathOptions::new(dir.path()),
             gc: None,
+            meta_cache_size: None,
         });
         // test different sizes, below, at, and above the inline threshold
         let sizes = [
