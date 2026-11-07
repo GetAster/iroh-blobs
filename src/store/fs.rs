@@ -1603,6 +1603,85 @@ pub mod tests {
         Ok(())
     }
 
+    /// Data acknowledged by `sync_db` is in the database file: a copy of the
+    /// file taken right after the sync, without any shutdown, has it all.
+    #[tokio::test]
+    async fn test_sync_db_makes_writes_durable() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let db_dir = testdir.path().join("db");
+        let store = FsStore::load(&db_dir).await?;
+        let mut expected = Vec::new();
+        for i in 0..50u32 {
+            let data = format!("durable {i}").into_bytes();
+            let tt = store.add_bytes(data.clone()).temp_tag().await?;
+            expected.push((tt.hash(), data));
+            if i % 10 == 9 {
+                store.sync_db().await?;
+            }
+        }
+        store.sync_db().await?;
+        let copy_dir = testdir.path().join("copy");
+        std::fs::create_dir_all(&copy_dir)?;
+        std::fs::copy(db_dir.join("blobs.db"), copy_dir.join("blobs.db"))?;
+        let copy =
+            FsStore::load_with_opts(copy_dir.join("blobs.db"), Options::new(&copy_dir)).await?;
+        for (hash, data) in &expected {
+            assert_eq!(copy.get_bytes(*hash).await?, data.as_slice());
+        }
+        copy.shutdown().await?;
+        store.shutdown().await?;
+        // And after a clean reopen of the original.
+        let store = FsStore::load(&db_dir).await?;
+        for (hash, data) in &expected {
+            assert_eq!(store.get_bytes(*hash).await?, data.as_slice());
+        }
+        store.shutdown().await?;
+        Ok(())
+    }
+
+    /// Concurrent writers that each write and `sync_db` all succeed, and every
+    /// writer's data is durable once its sync returns.
+    #[tokio::test]
+    async fn test_concurrent_writers_sync_db() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let db_dir = testdir.path().join("db");
+        let store = FsStore::load(&db_dir).await?;
+        let mut tasks = Vec::new();
+        for w in 0..8u32 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut all = Vec::new();
+                for round in 0..10u32 {
+                    let mut tags = Vec::new();
+                    for i in 0..16u32 {
+                        let data = format!("writer {w} round {round} item {i}").into_bytes();
+                        let tt = store.add_bytes(data.clone()).temp_tag().await?;
+                        all.push((tt.hash(), data));
+                        tags.push(tt);
+                    }
+                    store.sync_db().await?;
+                }
+                anyhow::Ok(all)
+            }));
+        }
+        let mut expected = Vec::new();
+        for t in tasks {
+            expected.extend(t.await??);
+        }
+        let copy_dir = testdir.path().join("copy");
+        std::fs::create_dir_all(&copy_dir)?;
+        std::fs::copy(db_dir.join("blobs.db"), copy_dir.join("blobs.db"))?;
+        let copy =
+            FsStore::load_with_opts(copy_dir.join("blobs.db"), Options::new(&copy_dir)).await?;
+        for (hash, data) in &expected {
+            assert_eq!(store.get_bytes(*hash).await?, data.as_slice());
+            assert_eq!(copy.get_bytes(*hash).await?, data.as_slice());
+        }
+        copy.shutdown().await?;
+        store.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     // #[traced_test]
     async fn test_observe() -> TestResult<()> {
