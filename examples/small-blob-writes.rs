@@ -13,7 +13,10 @@ use std::{path::PathBuf, time::Instant};
 use anyhow::Result;
 use bao_tree::ChunkRanges;
 use clap::{Parser, Subcommand, ValueEnum};
-use iroh_blobs::{store::fs::FsStore, Hash};
+use iroh_blobs::{
+    store::fs::{options::Options, FsStore},
+    Hash,
+};
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 use redb::{Durability, TableDefinition};
 
@@ -35,6 +38,9 @@ struct Args {
     /// and `sync_db`; `--count` is split between them.
     #[clap(long, default_value_t = 1)]
     writers: usize,
+    /// Override `BatchOptions::max_write_batch` (meta commands per commit).
+    #[clap(long)]
+    max_write_batch: Option<usize>,
     /// Report every this many blobs.
     #[clap(long, default_value_t = 100_000)]
     report: usize,
@@ -126,9 +132,19 @@ fn values(count: usize, size: usize, seed: u64) -> impl Iterator<Item = bytes::B
     })
 }
 
+async fn open_store(dir: &std::path::Path, args: &Args) -> Result<FsStore> {
+    let mut options = Options::new(dir);
+    if let Some(n) = args.max_write_batch {
+        options.batch.max_write_batch = n;
+    }
+    FsStore::load_with_opts(dir.join("blobs.db"), options)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:#}"))
+}
+
 async fn run_store(args: &Args, source_only: bool) -> Result<()> {
     let src_dir = args.dir.join("source");
-    let src = FsStore::load(&src_dir).await?;
+    let src = open_store(&src_dir, args).await?;
     let mut meter = Meter::new("source");
     let per_writer = args.count / args.writers;
     let mut tasks = Vec::new();
@@ -181,7 +197,7 @@ async fn run_store(args: &Args, source_only: bool) -> Result<()> {
     }
 
     let dst_dir = args.dir.join("receiver");
-    let dst = FsStore::load(&dst_dir).await?;
+    let dst = open_store(&dst_dir, args).await?;
     let mut meter = Meter::new("receiver");
     let mut since = 0;
     for (i, chunk) in hashes.chunks(args.batch).enumerate() {
