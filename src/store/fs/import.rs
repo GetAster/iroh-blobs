@@ -618,6 +618,7 @@ mod tests {
             path: PathOptions::new(dir.path()),
             gc: None,
             crash_consistency: CrashConsistency::PowerLoss,
+            meta_cache_size: None,
         });
         // test different sizes, below, at, and above the inline threshold
         let sizes = [

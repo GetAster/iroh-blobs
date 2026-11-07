@@ -654,9 +654,14 @@ impl Actor {
         mut ds: DeleteHandle,
         options: BatchOptions,
         syncs_files: bool,
+        cache_size: Option<usize>,
     ) -> Result<Self, ActorError> {
         debug!("creating or opening meta database at {}", db_path.display());
-        let db = match redb::Database::create(db_path) {
+        let mut builder = redb::Database::builder();
+        if let Some(cache_size) = cache_size {
+            builder.set_cache_size(cache_size);
+        }
+        let db = match builder.create(db_path) {
             Ok(db) => db,
             Err(DatabaseError::UpgradeRequired(v)) => {
                 return Err(anyerr!(
@@ -1262,6 +1267,7 @@ mod tests {
             deletes,
             BatchOptions::default(),
             false,
+            None,
         )?);
         let expected = Run {
             boot_id: boot_id::current(),

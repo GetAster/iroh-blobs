@@ -753,6 +753,86 @@ impl Remote {
         Ok(stats)
     }
 
+    /// Execute a get-many request on `conn`, reporting each child as the
+    /// provider sends it.
+    ///
+    /// The request's ranges are sent as given: pass the locally missing
+    /// ranges. A child whose ranges are empty is not sent by the provider and
+    /// produces no event. A child is [`GetManyEvent::Finished`] only once it
+    /// is verified and stored, so an error ends the call with at most one
+    /// child [`GetManyEvent::Started`] and not finished: the one the stream
+    /// failed on.
+    ///
+    /// With `clock`, the waits on local work (the store and `events`) stop
+    /// it, so a downloader stall guard does not blame them on the provider.
+    pub(crate) async fn execute_get_many_children(
+        &self,
+        conn: impl GetStreamPair,
+        request: GetManyRequest,
+        mut events: impl Sink<GetManyEvent, Error = irpc::channel::SendError>,
+        clock: Option<&StallClock>,
+    ) -> GetResult<Stats> {
+        let store = self.store();
+        let hashes = request.hashes.clone();
+        let pair = conn.open_stream_pair().await.map_err(|e| {
+            e!(
+                GetError::LocalFailure,
+                n0_error::anyerr!("failed to open stream pair: {e}")
+            )
+        })?;
+        let next_child =
+            crate::get::fsm::start_get_many_on(pair.recv, pair.send, request, Default::default())
+                .await?;
+        let at_closing = match next_child {
+            Ok(at_start_child) => {
+                let mut next_child = Ok(at_start_child);
+                loop {
+                    let at_start_child = match next_child {
+                        Ok(at_start_child) => at_start_child,
+                        Err(at_closing) => break at_closing,
+                    };
+                    let index = at_start_child.offset() as usize;
+                    let Some(hash) = hashes.get(index).copied() else {
+                        break at_start_child.finish();
+                    };
+                    {
+                        let _local = clock.map(StallClock::local);
+                        events
+                            .send(GetManyEvent::Started(index))
+                            .await
+                            .map_err(|e| e!(GetError::LocalFailure, e.into()))?;
+                    }
+                    let header = at_start_child.next(hash);
+                    let end = get_blob_ranges_impl(
+                        header,
+                        hash,
+                        store,
+                        (&mut events).with_map(GetManyEvent::Progress),
+                        clock,
+                    )
+                    .await?;
+                    {
+                        let _local = clock.map(StallClock::local);
+                        events
+                            .send(GetManyEvent::Finished(index))
+                            .await
+                            .map_err(|e| e!(GetError::LocalFailure, e.into()))?;
+                    }
+                    next_child = match end.next() {
+                        EndBlobNext::MoreChildren(at_start_child) => Ok(at_start_child),
+                        EndBlobNext::Closing(at_closing) => Err(at_closing),
+                    }
+                }
+            }
+            Err(at_closing) => at_closing,
+        };
+        let stats = at_closing
+            .next()
+            .await
+            .map_err(|e| e!(GetError::AtClosingNext, e))?;
+        Ok(stats)
+    }
+
     pub fn execute_get_many(&self, conn: Connection, request: GetManyRequest) -> GetProgress {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let tx2 = tx.clone();
@@ -864,6 +944,18 @@ pub enum ExecuteError {
         #[error(std_err)]
         source: tokio::sync::mpsc::error::SendError<BaoContentItem>,
     },
+}
+
+/// What [`Remote::execute_get_many_children`] reports about one get-many
+/// response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GetManyEvent {
+    /// The provider started sending the child at this request index.
+    Started(usize),
+    /// Payload bytes read on the stream so far, cumulative over every child.
+    Progress(u64),
+    /// The child at this request index is verified and stored.
+    Finished(usize),
 }
 
 pub trait GetStreamPair: Send + 'static {

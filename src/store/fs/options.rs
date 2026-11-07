@@ -153,6 +153,10 @@ pub struct Options {
     pub gc: Option<GcConfig>,
     /// What kind of crash the store stays consistent through.
     pub crash_consistency: CrashConsistency,
+    /// Page cache size of the metadata database, in bytes. `None` keeps
+    /// redb's default (1 GiB). The cache grows up to this bound as pages are
+    /// read, so it bounds the store's resident memory for metadata.
+    pub meta_cache_size: Option<usize>,
 }
 
 impl Options {
@@ -164,6 +168,7 @@ impl Options {
             batch: BatchOptions::default(),
             gc: None,
             crash_consistency: CrashConsistency::default(),
+            meta_cache_size: None,
         }
     }
 

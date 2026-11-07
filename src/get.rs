@@ -145,11 +145,22 @@ pub mod fsm {
         request: GetManyRequest,
         counters: RequestCounters,
     ) -> std::result::Result<Result<AtStartChild, AtClosing>, GetError> {
-        let start = Instant::now();
-        let (mut writer, reader) = connection
+        let (writer, reader) = connection
             .open_bi()
             .await
             .map_err(|e| e!(InitialNextError::Open, e.into()))?;
+        start_get_many_on(reader, writer, request, counters).await
+    }
+
+    /// [`start_get_many`] on an already opened stream pair, such as the
+    /// downloader's transformed streams.
+    pub async fn start_get_many_on<R: RecvStream, W: SendStream>(
+        reader: R,
+        mut writer: W,
+        request: GetManyRequest,
+        counters: RequestCounters,
+    ) -> std::result::Result<Result<AtStartChild<R>, AtClosing<R>>, GetError> {
+        let start = Instant::now();
         let request = Request::GetMany(request);
         let request_bytes = postcard::to_stdvec(&request)
             .map_err(|source| e!(GetError::BadRequest, AnyError::from_std(source)))?;
