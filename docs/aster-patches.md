@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.103.1` |
 | Integration branch | `upgrade/iroh-blobs-v0.103.1` (cut from `v0.103.1`; `upgrade/iroh-blobs-v0.103` is the historical per-minor line on `v0.103.0`) |
-| Tag | `aster-iroh-blobs-v0.103.2002` |
-| Pinned commit | `e7937c995dd0b947234e5759a2a81d5609fa900e` |
-| Crate version | 0.103.2002 (workspace spec `iroh-blobs = "0.103.2002"`) |
+| Tag | `aster-iroh-blobs-v0.103.2003` |
+| Pinned commit | `275c207e4cf1b89344250c4456ffad86d1122254` |
+| Crate version | 0.103.2003 (workspace spec `iroh-blobs = "0.103.2003"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-blobs.git` |
 
 The fork's own `[patch.crates-io]` (row 5, re-pinned by `825b70e8`) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001) and iroh-util `b28211ec` (0.6.3-p7), all matching the manifest. Upstream `v0.103.1` requires iroh-util 0.6.0; `15d47bdb` raises the requirement to 0.6.3 for row 34.
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 5, re-pinned by `825b70e8`) pins iroh `9
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "e7937c995dd0b947234e5759a2a81d5609fa900e" }
+iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "275c207e4cf1b89344250c4456ffad86d1122254" }
 ```
 
 ## Patches
@@ -57,6 +57,7 @@ Row numbers are stable patch ids shared across Aster's iroh-family forks (iroh, 
 | 40 | none recorded (`48671037`) | `Options::meta_cache_size: Option<usize>` sets the metadata database's redb page cache (default `None`, redb's 1 GiB). A new public field: struct-literal `Options` construction must add it. Test: `test_meta_cache_size_store_round_trips`. Asked for by portal-sync (§O). |
 | 75 | none recorded (`832bccea`, `5ea93341`, `130c7429`) | The metadata actor group-commits durability waiters: a `SyncDb` joins the open write transaction instead of ending it, the actor drains only what is already queued once a waiter exists, commits, then answers every waiter (a lone writer still commits at once). Write transactions are timed by `max_write_duration` (it was never read; the loop used `max_read_duration`), and `max_write_batch` defaults to 10000 (was 1000). Files: `src/store/fs/meta.rs`, `src/store/fs/meta/proto.rs`, `src/store/fs/util.rs`, `src/store/fs/options.rs`. Tests: `queued_syncs_share_one_commit`, `lone_sync_does_not_wait_for_timer`, `batch_cap_splits_commits`, `test_sync_db_makes_writes_durable`, `test_concurrent_writers_sync_db`. | Bytes written per small blob under concurrent durable writers (portal-sync, aster-request §M(4)): 8 writers at batch 128 went from 10.6 to 9.1 KB/blob. | carried | A failed commit now answers every waiter with the error (before, sync callers saw a dropped channel). |
 | 76 | none recorded (`94e1229b`) | Schema `blobs-1`: one row per blob holding the postcard `EntryState<()>` header (byte-identical to `blobs-0` values) plus any inline data and inline outboard as a trailer; `inline-data-0` and `inline-outboard-0` are gone. `Actor::new` migrates a legacy store in resumable chunks (20,000 rows or 16 MiB per write transaction; each chunk inserts into `blobs-1` and removes the same keys from the three legacy tables; the last drops them). Files: `src/store/fs/meta/row.rs`, `src/store/fs/meta/migrate.rs`, `src/store/fs/meta.rs`, `src/store/fs/meta/tables.rs`, `src/store/fs/entry_state.rs`. | Each small-blob insert dirtied a random leaf in two hash-keyed tables; one row halves that: 256 B blobs write 39% fewer bytes (12.8 to 7.8 KB/blob), 8 KiB blobs 16% fewer. A 1M-blob store migrates in about 6 s. | carried | One-way: older code cannot open a migrated store. Porting: keep the legacy `Value` impl in `migrate.rs` while any store may still hold `blobs-0`. |
+| 79 | none recorded (`275c207e`) | Requires zstd 0.14.3 (was `0.14`). zstd 0.14.3 requires zstd-safe 8.2.0 and zstd-sys 2.1.2, so no consumer resolves a release with the 2026-10-16 advisories (RUSTSEC-2026-0391, 0395-0406, 0410). File: `Cargo.toml`. | Requested by aster-idp; Aster's `aster_transport_core` carries the same floor. | `275c207e` | carried | Drop when upstream requires zstd 0.14.3 or later. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -159,7 +160,15 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 0.103.2002 (2026-11-07), current
+### 0.103.2003 (2026-11-08), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.103.1` | `aster-iroh-blobs-v0.103.2003` | `275c207e4cf1b89344250c4456ffad86d1122254` | `upgrade/iroh-blobs-v0.103.1` |
+
+- **`aster-iroh-blobs-v0.103.2003`** (`275c207e`): row 79 (zstd 0.14.3 floor); the lockfile also moves zstd, rustls-webpki, webpki-roots, webpki-root-certs and ctutils past their advisories (`16020008`). 153 lib tests pass; iroh-docs re-pins to it as `aster-iroh-docs-v0.101.1032`.
+
+### 0.103.2002 (2026-11-07)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
