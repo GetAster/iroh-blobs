@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-blobs"
-version = "0.103.2002"
+version = "0.103.2003"
 dependencies = [
  "anyhow",
  "arrayvec",
