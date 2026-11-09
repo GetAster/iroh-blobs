@@ -26,7 +26,7 @@ use crate::{
     get::{
         fsm::{
             AtBlobHeader, AtConnected, AtEndBlob, BlobContentNext, ConnectedNext, DecodeError,
-            EndBlobNext,
+            EndBlobNext, InitialNextError,
         },
         GetError, GetResult, Stats, StreamPair,
     },
@@ -597,8 +597,6 @@ impl Remote {
             payload_bytes_sent: 0,
             sender: progress,
         };
-        // we are not going to need this!
-        recv.stop(0u32.into()).anyerr()?;
         // write the request. Unlike for reading, we can just serialize it sync using postcard.
         let request = write_push_request(request, &mut send).await?;
         let mut request_ranges = request.ranges.iter_infinite();
@@ -613,6 +611,7 @@ impl Remote {
         if request.ranges.is_blob() {
             // we are done
             send.finish().anyerr()?;
+            push_outcome(&mut recv).await?;
             return Ok(Default::default());
         }
         let mut hash_seq = LazyHashSeq::new(self.store().blobs().clone(), root);
@@ -629,6 +628,7 @@ impl Remote {
                 .await?;
         }
         send.finish().anyerr()?;
+        push_outcome(&mut recv).await?;
         Ok(Default::default())
     }
 
@@ -671,12 +671,10 @@ impl Remote {
     ) -> GetResult<Stats> {
         let store = self.store();
         let root = request.hash;
-        let conn = conn.open_stream_pair().await.map_err(|e| {
-            e!(
-                GetError::LocalFailure,
-                n0_error::anyerr!("failed to open stream pair: {e}")
-            )
-        })?;
+        let conn = conn
+            .open_stream_pair()
+            .await
+            .map_err(|e| e!(InitialNextError::Open, e))?;
         // I am cloning the connection, but it's fine because the original connection or ConnectionRef stays alive
         // for the duration of the operation.
         let connected =
@@ -928,12 +926,16 @@ async fn get_blob_ranges_impl<R: RecvStream>(
         })
     };
     let complete = async move {
-        handle.rx.await.map_err(|e| {
-            e!(
-                GetError::LocalFailure,
-                n0_error::anyerr!("error reading from import stream: {e}")
-            )
-        })
+        handle
+            .rx
+            .await
+            .map_err(|e| {
+                e!(
+                    GetError::LocalFailure,
+                    n0_error::anyerr!("error reading from import stream: {e}")
+                )
+            })?
+            .map_err(|e| e!(GetError::LocalFailure, e.into()))
     };
     let (_, end) = tokio::try_join!(complete, write)?;
     Ok(end)
@@ -970,6 +972,16 @@ impl HashSeqChunk {
     pub fn base(&self) -> u64 {
         self.offset / 32
     }
+}
+
+/// Waits for the provider to end its half of a push stream.
+///
+/// The provider sends no data on it. It finishes its half once the pushed data
+/// is stored, and resets it with an error code if it rejects the request or
+/// fails to store the data.
+async fn push_outcome(recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
+    recv.read_to_end(0).await.std_context("push failed")?;
+    Ok(())
 }
 
 async fn write_push_request(
