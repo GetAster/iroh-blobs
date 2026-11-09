@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-blobs"
-version = "0.104.1"
+version = "0.104.2001"
 dependencies = [
  "anyhow",
  "async-compression",
