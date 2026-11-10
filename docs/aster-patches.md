@@ -23,17 +23,17 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.104.1` (`1fbb0272`) |
 | Integration branch | `upgrade/iroh-blobs-v0.104.1` (cut from `v0.104.1`; `upgrade/iroh-blobs-v0.103.1` and `upgrade/iroh-blobs-v0.103` are historical) |
-| Tag | `aster-iroh-blobs-v0.104.2001` |
-| Pinned commit | `da34ac02aeaba0cb80c71b6f29de7ff643b7e39c` |
+| Tag | `aster-iroh-blobs-v0.104.2001-p1` (`aster-iroh-blobs-v0.104.2001` is the previous pin) |
+| Pinned commit | `86ef7da07d5883d2c8bc25e32b45314571d0025d` |
 | Crate version | 0.104.2001 (workspace spec `iroh-blobs = "0.104.2001"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-blobs.git` |
 
-The fork's own `[patch.crates-io]` (row 5, `7b6bf5cf`) pins iroh `9ba1447d` (1.4.2002), noq `379f73677c` (1.4.1001) and iroh-util `bfef8edb` (0.7.1001), all matching the manifest. Upstream `v0.104.1` requires iroh-util 0.7.0; `6b4fcfdd` raises the requirement to 0.7.1001 for row 34. The dev-dependency `iroh-mdns-address-lookup` is 0.6 (upstream's), which resolves to the forked iroh, so the graph holds one iroh.
+The fork's own `[patch.crates-io]` (row 5, `7b6bf5cf`) pins iroh `370b54434` (1.4.2003), noq `4e193fb2d` (1.4.1002) and iroh-util `f91c1f97` (0.7.1001-p1), all matching the manifest (`86ef7da0`, the `-p1` re-pin; `da34ac02` held iroh 1.4.2002, noq 1.4.1001 and iroh-util `bfef8edb`). Upstream `v0.104.1` requires iroh-util 0.7.0; `6b4fcfdd` raises the requirement to 0.7.1001 for row 34. The dev-dependency `iroh-mdns-address-lookup` is 0.6 (upstream's), which resolves to the forked iroh, so the graph holds one iroh.
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "da34ac02aeaba0cb80c71b6f29de7ff643b7e39c" }
+iroh-blobs = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "86ef7da07d5883d2c8bc25e32b45314571d0025d" }
 ```
 
 ## Patches
@@ -170,7 +170,15 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### iroh-family upstream wave (2026-11-09), current
+### iroh 1.4.2003 and noq 1.4.1002 re-pin (2026-11-10), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.104.1` | `aster-iroh-blobs-v0.104.2001-p1` | `86ef7da07d5883d2c8bc25e32b45314571d0025d` | `upgrade/iroh-blobs-v0.104.1` |
+
+- **`aster-iroh-blobs-v0.104.2001-p1`** (`86ef7da0`): re-pin only (row 5; "build: re-pin noq 1.4.1002 and iroh 1.4.2003"), to iroh `370b54434` (Aster iroh 1.4.2003), noq `4e193fb2d` (Aster noq 1.4.1002) and iroh-util `f91c1f97` (`aster-iroh-util-v0.7.1001-p1`), the "vpn-paths" wave. No code or version change; the crate stays 0.104.2001. Validation: `cargo test` main suite 204 passed (1 ignored), 0 failed.
+
+### iroh-family upstream wave (2026-11-09)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
