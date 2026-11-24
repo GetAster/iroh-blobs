@@ -430,19 +430,34 @@ impl Blobs {
         hashes: impl IntoIterator<Item = Hash>,
     ) -> RequestResult<Vec<super::Result<Option<Bytes>>>> {
         let hashes = hashes.into_iter().collect::<Vec<_>>();
-        let results = self
-            .client
-            .rpc(BlobBytesRequest {
-                hashes: hashes.clone(),
-            })
-            .await??;
-        if results.len() != hashes.len() {
+        // The client answers the empty hash (upstream v0.105: the stores no longer
+        // special-case it, so a store would report it as not found).
+        let asked = hashes
+            .iter()
+            .copied()
+            .filter(|hash| *hash != Hash::EMPTY)
+            .collect::<Vec<_>>();
+        let results = if asked.is_empty() {
+            Vec::new()
+        } else {
+            self.client
+                .rpc(BlobBytesRequest {
+                    hashes: asked.clone(),
+                })
+                .await??
+        };
+        if results.len() != asked.len() {
             return Err(io::Error::other("blob bytes response length mismatch").into());
         }
 
-        let mut out = Vec::with_capacity(results.len());
-        for (hash, result) in hashes.into_iter().zip(results) {
-            match result {
+        let mut results = results.into_iter();
+        let mut out = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            if hash == Hash::EMPTY {
+                out.push(Ok(Some(Bytes::new())));
+                continue;
+            }
+            match results.next().expect("length checked above") {
                 BlobBytesResult::Complete { data } => out.push(Ok(Some(data))),
                 BlobBytesResult::Partial { .. } | BlobBytesResult::NotFound => out.push(Ok(None)),
                 BlobBytesResult::NeedsExport { .. } => {
@@ -585,9 +600,31 @@ impl Blobs {
         &self,
         hashes: impl IntoIterator<Item = impl Into<Hash>>,
     ) -> irpc::Result<Vec<BlobStatus>> {
-        let hashes = hashes.into_iter().map(Into::into).collect();
-        let msg = BlobStatusManyRequest { hashes };
-        self.client.rpc(msg).await
+        let hashes: Vec<Hash> = hashes.into_iter().map(Into::into).collect();
+        // The client answers the empty hash, as `status` does.
+        let asked = hashes
+            .iter()
+            .copied()
+            .filter(|hash| *hash != Hash::EMPTY)
+            .collect::<Vec<_>>();
+        let mut answers = if asked.is_empty() {
+            Vec::new()
+        } else {
+            self.client
+                .rpc(BlobStatusManyRequest { hashes: asked })
+                .await?
+        }
+        .into_iter();
+        Ok(hashes
+            .into_iter()
+            .map(|hash| {
+                if hash == Hash::EMPTY {
+                    BlobStatus::Complete { size: 0 }
+                } else {
+                    answers.next().unwrap_or(BlobStatus::NotFound)
+                }
+            })
+            .collect())
     }
 
     pub async fn has(&self, hash: impl Into<Hash>) -> irpc::Result<bool> {

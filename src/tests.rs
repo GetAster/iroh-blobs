@@ -770,6 +770,65 @@ async fn empty_hash_is_complete(store: &Store, dir: &std::path::Path) -> TestRes
     Ok(())
 }
 
+/// Aster's batch reads answer the empty hash like `status` and `get_bytes` do:
+/// since upstream v0.105 the stores no longer special-case it, so the client must.
+async fn empty_hash_in_batch_reads(store: &Store) -> TestResult<()> {
+    let data = Bytes::from_static(b"batch read value");
+    let hash = store.add_bytes(data.clone()).await?.hash;
+    let missing = Hash::new(b"absent from the store");
+    let bytes = store
+        .blobs()
+        .get_bytes_many_if_complete(vec![missing, hash, Hash::EMPTY, hash])
+        .await?;
+    let bytes = bytes.into_iter().collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        bytes,
+        vec![None, Some(data.clone()), Some(Bytes::new()), Some(data)]
+    );
+    let status = store
+        .blobs()
+        .status_many(vec![missing, hash, Hash::EMPTY])
+        .await?;
+    assert_eq!(
+        status,
+        vec![
+            BlobStatus::NotFound,
+            BlobStatus::Complete { size: 16 },
+            BlobStatus::Complete { size: 0 },
+        ]
+    );
+    // Only the empty hash: nothing needs to reach the store.
+    assert_eq!(
+        store
+            .blobs()
+            .get_bytes_many_if_complete([Hash::EMPTY])
+            .await?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?,
+        vec![Some(Bytes::new())]
+    );
+    assert_eq!(
+        store.blobs().status_many([Hash::EMPTY]).await?,
+        vec![BlobStatus::Complete { size: 0 }]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_hash_in_batch_reads_mem() -> TestResult<()> {
+    empty_hash_in_batch_reads(&MemStore::new()).await
+}
+
+#[cfg(feature = "fs-store")]
+#[tokio::test]
+async fn empty_hash_in_batch_reads_fs() -> TestResult<()> {
+    let dir = tempfile::tempdir()?;
+    let store = crate::store::fs::FsStore::load(dir.path()).await?;
+    empty_hash_in_batch_reads(&store).await?;
+    store.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn empty_hash_is_complete_mem() -> TestResult<()> {
     let testdir = tempfile::tempdir()?;
