@@ -30,6 +30,8 @@ Historical and current tag schemes in this repository:
 
 The fork's own `[patch.crates-io]` (row 5, `9e9ec6f6e`) pins iroh `b010df8a65` (1.5.1001), noq `819373faf` (1.5.1001) and iroh-util `e83da6f8` (0.7.1001-p2), all matching the manifest (`86ef7da0`, the previous `-p1` re-pin, held iroh 1.4.2003, noq 1.4.1002 and iroh-util `f91c1f97`; `da34ac02` held iroh 1.4.2002, noq 1.4.1001 and iroh-util `bfef8edb`). iroh-blobs 0.105.0 requires `irpc = "1.0.0"`, which Aster bridges (one irpc in the graph with iroh-docs). Upstream `v0.104.1` requires iroh-util 0.7.0; `6b4fcfdd` raises the requirement to 0.7.1001 for row 34. The dev-dependency `iroh-mdns-address-lookup` is 0.6 (upstream's), which resolves to the forked iroh, so the graph holds one iroh.
 
+**Re-pin 2026-11-24 (`aster-iroh-blobs-v0.105.1001-p1`, `da0a972e`), supersedes the iroh pin above:** the fork's `[patch.crates-io]` and lock name iroh `b0fac795ec` (Aster iroh 1.5.1002, tag `aster-iroh-v1.5.1002`). iroh 1.5.1002 differs from 1.5.1001 only in manifests: iroh now requires the iroh-relay it ships (iroh ledger row `relay-requirement`). No version change; noq unchanged. Its iroh-util pin stays `e83da6f8`: the util re-pin `489f339d` changes only util's own `[patch.crates-io]`, which Cargo ignores when util is a dependency, so the code built is the same. Aster's `fork_compat` ran the suite on it: 0 failed.
+
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
