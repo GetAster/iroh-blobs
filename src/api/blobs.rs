@@ -607,21 +607,30 @@ impl Blobs {
             .copied()
             .filter(|hash| *hash != Hash::EMPTY)
             .collect::<Vec<_>>();
-        let mut answers = if asked.is_empty() {
+        let expected = asked.len();
+        let answers = if asked.is_empty() {
             Vec::new()
         } else {
             self.client
                 .rpc(BlobStatusManyRequest { hashes: asked })
                 .await?
+        };
+        // One answer per asked hash, as for the byte reads. Padding a short
+        // response with NotFound would report a blob as absent that the store
+        // never answered for.
+        if answers.len() != expected {
+            return Err(irpc::Error::from(irpc::channel::oneshot::RecvError::from(
+                io::Error::other("blob status response length mismatch"),
+            )));
         }
-        .into_iter();
+        let mut answers = answers.into_iter();
         Ok(hashes
             .into_iter()
             .map(|hash| {
                 if hash == Hash::EMPTY {
                     BlobStatus::Complete { size: 0 }
                 } else {
-                    answers.next().unwrap_or(BlobStatus::NotFound)
+                    answers.next().expect("length checked above")
                 }
             })
             .collect())
