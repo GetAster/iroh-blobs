@@ -619,8 +619,15 @@ impl Blobs {
         // response with NotFound would report a blob as absent that the store
         // never answered for.
         if answers.len() != expected {
-            return Err(irpc::Error::from(irpc::channel::oneshot::RecvError::from(
-                io::Error::other("blob status response length mismatch"),
+            // `irpc::Error` cannot carry a message without irpc's `rpc` feature, so
+            // log the counts and report the answer as never delivered.
+            tracing::warn!(
+                expected,
+                got = answers.len(),
+                "blob status response length mismatch"
+            );
+            return Err(irpc::Error::from(n0_error::e!(
+                irpc::channel::oneshot::RecvError::SenderClosed
             )));
         }
         let mut answers = answers.into_iter();
