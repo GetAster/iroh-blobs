@@ -396,7 +396,15 @@ mod tests {
     fn open_actor(dir: &Path) -> Actor {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let (_protect, ds) = delete_set::pair(Arc::new(PathOptions::new(dir)));
-        Actor::new(dir.join("meta.redb"), rx, ds, BatchOptions::default(), false, None).unwrap()
+        Actor::new(
+            dir.join("meta.redb"),
+            rx,
+            ds,
+            BatchOptions::default(),
+            false,
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
