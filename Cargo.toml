@@ -110,3 +110,13 @@ required-features = ["fs-store"]
 [[example]]
 name = "random_store"
 required-features = ["fs-store", "unstable-util"]
+
+# Pin to Aster forks (ledger row 5).
+[patch.crates-io]
+iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "b010df8a650f05f9bb309e021df8c44f09d6eb0b" }
+iroh-base = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "b010df8a650f05f9bb309e021df8c44f09d6eb0b" }
+iroh-relay = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "b010df8a650f05f9bb309e021df8c44f09d6eb0b" }
+noq = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "819373fafcd4a21aaf5a81352224218caa462b44" }
+noq-udp = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "819373fafcd4a21aaf5a81352224218caa462b44" }
+noq-proto = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "819373fafcd4a21aaf5a81352224218caa462b44" }
+iroh-util = { git = "https://forge.emrul.dev/Aster/iroh-util.git", rev = "e83da6f8605adf071a6a846a0d804fb418b606a6" }
