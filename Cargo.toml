@@ -113,9 +113,9 @@ required-features = ["fs-store", "unstable-util"]
 
 # Pin to Aster forks (ledger row 5).
 [patch.crates-io]
-iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "b010df8a650f05f9bb309e021df8c44f09d6eb0b" }
-iroh-base = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "b010df8a650f05f9bb309e021df8c44f09d6eb0b" }
-iroh-relay = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "b010df8a650f05f9bb309e021df8c44f09d6eb0b" }
+iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "b0fac795ec2cabefbab48cf076f0ee32babf033e" }
+iroh-base = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "b0fac795ec2cabefbab48cf076f0ee32babf033e" }
+iroh-relay = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "b0fac795ec2cabefbab48cf076f0ee32babf033e" }
 noq = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "819373fafcd4a21aaf5a81352224218caa462b44" }
 noq-udp = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "819373fafcd4a21aaf5a81352224218caa462b44" }
 noq-proto = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "819373fafcd4a21aaf5a81352224218caa462b44" }
