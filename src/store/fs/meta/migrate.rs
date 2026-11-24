@@ -570,6 +570,8 @@ mod tests {
         let mut listed = store.blobs().list().hashes().await.unwrap();
         listed.sort();
         let mut want: Vec<_> = expected.keys().copied().collect();
+        // Since upstream v0.105 the client lists the empty hash, which the store never holds.
+        want.push(Hash::EMPTY);
         want.sort();
         assert_eq!(listed, want);
         let tags: Vec<_> = store.tags().list().await.unwrap().collect().await;
