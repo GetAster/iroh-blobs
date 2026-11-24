@@ -829,6 +829,208 @@ async fn empty_hash_in_batch_reads_fs() -> TestResult<()> {
     Ok(())
 }
 
+/// A store backed by an actor that answers batch reads with `delta` more answers
+/// than it was asked for (fewer when negative), and counts the commands it sees.
+fn miscounting_store(delta: isize) -> (Store, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use crate::api::proto::{BlobBytesResult, Command};
+    let seen = Arc::new(AtomicUsize::new(0));
+    let (tx, mut rx) = mpsc::channel::<Command>(8);
+    let counter = seen.clone();
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            match cmd {
+                Command::BlobStatusMany(msg) => {
+                    let n = msg.inner.hashes.len().saturating_add_signed(delta);
+                    msg.tx.send(vec![BlobStatus::NotFound; n]).await.ok();
+                }
+                Command::BlobBytes(msg) => {
+                    let n = msg.inner.hashes.len().saturating_add_signed(delta);
+                    msg.tx
+                        .send(Ok(vec![BlobBytesResult::NotFound; n]))
+                        .await
+                        .ok();
+                }
+                _ => {}
+            }
+        }
+    });
+    (Store::from_client(tx), seen)
+}
+
+/// `status_many` answers every hash once, the empty one from the client.
+#[tokio::test]
+async fn status_many_answers_every_hash_once() -> TestResult<()> {
+    let hashes = vec![Hash::new(b"one"), Hash::EMPTY, Hash::new(b"two")];
+    // one non-empty hash is answered by the store, so two are asked for
+    let (store, _) = miscounting_store(0);
+    let status = store.blobs().status_many(hashes.clone()).await?;
+    assert_eq!(
+        status,
+        vec![
+            BlobStatus::NotFound,
+            BlobStatus::Complete { size: 0 },
+            BlobStatus::NotFound
+        ]
+    );
+    Ok(())
+}
+
+/// A store that answers with too few entries is an error, not padded with `NotFound`.
+#[tokio::test]
+async fn status_many_rejects_a_short_response() -> TestResult<()> {
+    let hashes = vec![Hash::new(b"one"), Hash::EMPTY, Hash::new(b"two")];
+    let (store, _) = miscounting_store(-1);
+    assert!(
+        store.blobs().status_many(hashes).await.is_err(),
+        "a short response must be an error"
+    );
+    Ok(())
+}
+
+/// A store that answers with too many entries is an error, not truncated.
+#[tokio::test]
+async fn status_many_rejects_a_long_response() -> TestResult<()> {
+    let hashes = vec![Hash::new(b"one"), Hash::EMPTY, Hash::new(b"two")];
+    let (store, _) = miscounting_store(1);
+    assert!(
+        store.blobs().status_many(hashes).await.is_err(),
+        "a long response must be an error"
+    );
+    Ok(())
+}
+
+/// The byte reads check the response length the same way.
+#[tokio::test]
+async fn get_bytes_many_if_complete_checks_the_response_length() -> TestResult<()> {
+    let hashes = vec![Hash::new(b"one"), Hash::EMPTY, Hash::new(b"two")];
+    let (store, _) = miscounting_store(0);
+    assert_eq!(
+        store
+            .blobs()
+            .get_bytes_many_if_complete(hashes.clone())
+            .await?
+            .len(),
+        3
+    );
+    for delta in [-1, 1] {
+        let (store, _) = miscounting_store(delta);
+        assert!(
+            store
+                .blobs()
+                .get_bytes_many_if_complete(hashes.clone())
+                .await
+                .is_err(),
+            "a response {delta:+} entries long must be an error"
+        );
+    }
+    Ok(())
+}
+
+/// A batch of only the empty hash is answered by the client: no command reaches the store.
+#[tokio::test]
+async fn empty_hash_only_batches_send_no_request() -> TestResult<()> {
+    let (store, seen) = miscounting_store(0);
+    let hashes = [Hash::EMPTY, Hash::EMPTY];
+    assert_eq!(
+        store.blobs().status_many(hashes).await?,
+        vec![BlobStatus::Complete { size: 0 }; 2]
+    );
+    let bytes = store.blobs().get_bytes_many_if_complete(hashes).await?;
+    assert_eq!(bytes.len(), 2);
+    for bytes in bytes {
+        assert_eq!(bytes?, Some(Bytes::new()));
+    }
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+    Ok(())
+}
+
+/// Repeated empty hashes among real ones, a partial blob, and (fs) a blob too
+/// large to inline, which is read through the export fallback.
+async fn empty_hash_among_other_blobs(store: &Store) -> TestResult<()> {
+    use crate::protocol::ChunkRangesExt;
+
+    let small = Bytes::from_static(b"small");
+    let small_hash = store.add_bytes(small.clone()).await?.hash;
+    let large = test_data(64 * 1024);
+    let large_hash = store.add_bytes(large.clone()).await?.hash;
+    let partial_data = test_data(100_000);
+    let ranges = ChunkRanges::chunks(16..32);
+    let (partial_hash, bao) = create_n0_bao(&partial_data, &ranges)?;
+    store.import_bao_bytes(partial_hash, ranges, bao).await?;
+    let missing = Hash::new(b"absent");
+    let hashes = vec![
+        Hash::EMPTY,
+        partial_hash,
+        Hash::EMPTY,
+        large_hash,
+        Hash::EMPTY,
+        missing,
+        small_hash,
+        Hash::EMPTY,
+    ];
+    let bytes = store
+        .blobs()
+        .get_bytes_many_if_complete(hashes.clone())
+        .await?
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        bytes,
+        vec![
+            Some(Bytes::new()),
+            None,
+            Some(Bytes::new()),
+            Some(large),
+            Some(Bytes::new()),
+            None,
+            Some(small),
+            Some(Bytes::new()),
+        ]
+    );
+    let status = store.blobs().status_many(hashes).await?;
+    assert_eq!(
+        status,
+        vec![
+            BlobStatus::Complete { size: 0 },
+            BlobStatus::Partial { size: None },
+            BlobStatus::Complete { size: 0 },
+            BlobStatus::Complete { size: 64 * 1024 },
+            BlobStatus::Complete { size: 0 },
+            BlobStatus::NotFound,
+            BlobStatus::Complete { size: 5 },
+            BlobStatus::Complete { size: 0 },
+        ]
+    );
+    // A bounded, non-zero range of the empty blob has size 0 and no data.
+    let ranged = store
+        .export_ranges(Hash::EMPTY, 10..20)
+        .concatenate()
+        .await?;
+    assert!(ranged.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_hash_among_other_blobs_mem() -> TestResult<()> {
+    empty_hash_among_other_blobs(&MemStore::new()).await
+}
+
+#[cfg(feature = "fs-store")]
+#[tokio::test]
+async fn empty_hash_among_other_blobs_fs() -> TestResult<()> {
+    let dir = tempfile::tempdir()?;
+    let store = crate::store::fs::FsStore::load(dir.path()).await?;
+    empty_hash_among_other_blobs(&store).await?;
+    store.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn empty_hash_is_complete_mem() -> TestResult<()> {
     let testdir = tempfile::tempdir()?;
