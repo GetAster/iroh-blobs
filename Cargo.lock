@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-blobs"
-version = "0.105.0"
+version = "0.105.1001"
 dependencies = [
  "anyhow",
  "async-compression",
